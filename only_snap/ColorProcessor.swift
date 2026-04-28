@@ -5,7 +5,7 @@ import Metal
 /// Colour-processing modes.
 enum ColorMode {
     case normal
-    case experimental
+    case vintageGold
 }
 
 /// Applies a colour transform to a `CIImage`.
@@ -20,9 +20,9 @@ enum ColorProcessor {
         return CIContext(options: [.useSoftwareRenderer: false])
     }()
 
-    // RY atmosphere 3-D LUT — built once, reused for every photo
-    private static var ryLUTCache: Data?
-    private static let ryLUTDim = 33     // 33³ = 35 937 entries; good balance of accuracy/speed
+    // VG atmosphere 3-D LUT — built once, reused for every photo
+    private static var vgLUTCache: Data?
+    private static let vgLUTDim = 33     // 33³ = 35 937 entries; good balance of accuracy/speed
 
     // MARK: - Scene Analysis Struct
 
@@ -40,6 +40,14 @@ enum ColorProcessor {
         let hazeScore:      CGFloat  // min(R,G,B)/max(R,G,B)  higher = more haze or overexposure
         let isBacklit:      Bool     // center luminance < 55% of full-image luminance
 
+        // ── Computed scene metrics ────────────────────────────────────────────
+
+        /// Green-to-midRB ratio — used to detect foliage / park / garden scenes.
+        var gRatio: CGFloat {
+            let midRB = (avgR + avgB) / 2.0
+            return midRB > 0.01 ? avgG / midRB : 1.0
+        }
+
         // ── Semantic convenience flags ───────────────────────────────────────
         /// Golden-hour / sunrise: very warm light with active highlights.
         var isSunset:    Bool { kelvin < 3600 && highlightRatio > 0.30 && luminance > 0.25 }
@@ -51,6 +59,12 @@ enum ColorProcessor {
         var isRainSnow:  Bool {
             kelvin > 6300 && satScore < 0.18 && luminance > 0.25 && luminance < 0.75
         }
+        /// Water / lake / ocean / pool: cool-blue dominant, moderately saturated, not night.
+        /// Detected by blue channel significantly exceeding red, with meaningful saturation.
+        var isWaterScene: Bool {
+            let cbDiff = avgB - avgR
+            return cbDiff > 0.08 && avgB > 0.28 && satScore > 0.18 && !isNight
+        }
     }
 
     // MARK: - Public entry point
@@ -60,11 +74,11 @@ enum ColorProcessor {
         switch mode {
         case .normal:
             processed = image
-        case .experimental:
+        case .vintageGold:
             // skipPreSmooth: 105mm has its own CINoiseReduction + the universal post-upscale
             // denoise in CameraManager. Running the 0.01 pre-smooth too would stack three
             // passes and visibly over-blur telephoto output.
-            processed = applyExperimentalCurve(to: image, skipPreSmooth: focalLength == 105)
+            processed = applyVGCurve(to: image, skipPreSmooth: focalLength == 105)
         }
         return focalLength == 105 ? apply105mmEnhancement(to: processed) : processed
     }
@@ -127,8 +141,6 @@ enum ColorProcessor {
         let b = cs.b * 0.60 + fs.b * 0.40
 
         // ── Colour temperature — piecewise R/B → CCT ─────────────────────────
-        // More accurate than the old linear interpolation: accounts for the
-        // non-linear relationship between raw R/B ratio and correlated CCT.
         let rb = r / max(b, 0.001)
         let kelvin: CGFloat = {
             switch rb {
@@ -148,7 +160,6 @@ enum ColorProcessor {
         let fullL    = 0.2126 * fs.r   + 0.7152 * fs.g   + 0.0722 * fs.b
 
         // ── Saturation score ─────────────────────────────────────────────────
-        // (max − min) / max: measures colour richness independent of brightness.
         let maxC     = max(r, g, b)
         let minC     = min(r, g, b)
         let satScore = maxC > 0.01 ? (maxC - minC) / maxC : 0.0
@@ -159,12 +170,9 @@ enum ColorProcessor {
         } ?? lum
 
         // ── Haze / fog proxy ─────────────────────────────────────────────────
-        // If the minimum channel is elevated relative to maximum, the whole
-        // scene is "lifted" uniformly — the hallmark of haze, mist, or fog.
         let hazeScore = maxC > 0.01 ? minC / maxC : 0.0
 
         // ── Backlight detection ───────────────────────────────────────────────
-        // Subject (center) is significantly darker than the overall scene.
         let isBacklit = fullL > 0.06 && centerL < fullL * 0.55
 
         return SceneAnalysis(kelvin:        kelvin,
@@ -178,23 +186,30 @@ enum ColorProcessor {
                              isBacklit:     isBacklit)
     }
 
-    // MARK: - Experimental tone curve (calibrated, adaptive)
+    // MARK: - VG Vintage Gold pipeline
 
-    /// Full RY warm-film pipeline for saved stills.
+    /// Full VG (Vintage Gold) warm-film pipeline for saved stills.
+    ///
+    /// Positioning: Pentax Gold (luminance-driven shadow-blue → highlight-gold) +
+    /// Kodak Gold 200 (warm, saturated, beautiful skin tones, golden-hour excellence).
     ///
     /// Stages:
     ///   0. Optional pre-smooth (skipped for 105mm)
-    ///   1. Dynamic warm matrix — strength bell-curves with colour temperature
-    ///   2. CIToneCurve — film S-curve
-    ///   3. Adaptive saturation — dull scenes boosted, vivid scenes left alone
-    ///   4. Subtle split toning — cool shadows / warm highlights (CIColorPolynomial)
-    ///   5. Dynamic bloom — attenuated when highlights are intense; boosted when flat
-    ///   6. Scene-adaptive correction — per-scene fine-tuning (sunset, night, fog, etc.)
+    ///   1. VG Tone Curve — CIColorPolynomial luminance-separated toning
+    ///      (shadows: cool-blue; highlights: warm-gold)
+    ///   2. CIToneCurve — film S-curve contrast
+    ///   3. VG Atmosphere LUT — per-hue remap with green protection + water guard
+    ///   4. Adaptive saturation — dull scenes lifted, vivid scenes preserved
+    ///   5. Dynamic bloom — attenuated for hot highlights, boosted for flat scenes
+    ///   6. Scene-adaptive correction — per-scene fine-tuning
     ///
-    /// All scene metrics are computed ONCE on the raw image (before grading) so that
-    /// the classification reflects true ambient light, not our colour additions.
-    private static func applyExperimentalCurve(to image: CIImage,
-                                                skipPreSmooth: Bool = false) -> CIImage {
+    /// Key VG improvements over old RY approach:
+    ///   • Tone curve replaces global warm matrix → shadows stay cool, highlights go gold
+    ///   • Green protection in LUT → foliage stays green (not yellow-khaki)
+    ///   • Reduced cyan shift (-3° vs -10°) → water reflections preserved
+    ///   • Lighter global saturation touch → more natural colour fidelity
+    private static func applyVGCurve(to image: CIImage,
+                                      skipPreSmooth: Bool = false) -> CIImage {
 
         // ── 0. Pre-smooth ────────────────────────────────────────────────────
         let baseImage: CIImage
@@ -210,75 +225,47 @@ enum ColorProcessor {
         // ── Scene analysis (pre-grading) ─────────────────────────────────────
         let scene = analyzeImage(image)
 
-        // ── 1. Dynamic warm matrix ────────────────────────────────────────────
+        // ── 1. VG Tone Curve ──────────────────────────────────────────────────
         //
-        // Warmth strength is a bell curve:
-        //   kelvin ≤ 3000 K → warmStrength = 0.0  (very warm scene: avoid double-heating)
-        //   kelvin ~ 5000 K → warmStrength = 1.0  (neutral daylight: apply full warm look)
-        //   kelvin ≥ 7500 K → warmStrength = 0.0  (overcast: handled by separate path)
-        //
-        // Rising edge: smoothstep 3000→5000 K
-        // Falling edge: 1 − smoothstep 5000→7500 K
-        // Sunset boost: isSunset scenes keep warmth (don't attenuate the golden hour)
-        // Night damp:   very dark scenes get reduced warmth (amplifies noise)
-        let rise    = smoothstep(lo: 3000, hi: 5000, t: scene.kelvin)
-        let fall    = 1.0 - smoothstep(lo: 5000, hi: 7500, t: scene.kelvin)
-        let rawWarm = rise * fall
-        let warmStrength = (rawWarm
-            * (scene.isNight   ? 0.35 : 1.0)   // night: damp to 35%
-            * (scene.isSunset  ? 1.3  : 1.0)   // sunset: boost warm (clamp to 1 below)
-        ).clamped(to: 0...1)
-
-        let rScale = 1.0 + 0.05 * warmStrength   // R: modest warm boost
-        let bScale = 1.0 - 0.10 * warmStrength   // B: modest reduction (keeps foliage green)
-
-        guard let matFilter = CIFilter(name: "CIColorMatrix") else { return baseImage }
-        matFilter.setValue(baseImage, forKey: kCIInputImageKey)
-        // R: warm boost; cross-channel −0.03·B preserves sky purity
-        matFilter.setValue(CIVector(x: rScale, y: 0.00, z: -0.03 * warmStrength, w: 0),
-                           forKey: "inputRVector")
-        // G: near-neutral; cross-channel reduced to −0.01·B (was −0.03) to prevent
-        // over-pulling green from blue pixels which caused cyan sky artefacts.
-        matFilter.setValue(CIVector(x: 0.00, y: 0.98, z: -0.01 * warmStrength, w: 0),
-                           forKey: "inputGVector")
-        // B: modest reduction; −0.04·R bleed warms deep shadows
-        matFilter.setValue(CIVector(x: -0.04 * warmStrength, y: 0.00, z: bScale, w: 0),
-                           forKey: "inputBVector")
-        matFilter.setValue(CIVector(x: 0.00, y: 0.00, z: 0.00, w: 1), forKey: "inputAVector")
-        // Warm bias in blacks (barely perceptible — prevents pure cold shadows)
-        matFilter.setValue(CIVector(x: 0.006 * warmStrength, y: 0.003 * warmStrength,
-                                    z: 0.000, w: 0),
-                           forKey: "inputBiasVector")
-        guard let matOut = matFilter.outputImage else { return baseImage }
+        // Strength bell-curves with colour temperature:
+        //   kelvin ~ 5000 K → full strength 1.0 (neutral daylight)
+        //   kelvin < 3200 K → floor 0.40 (very warm scene: don't double-gold warm light)
+        //   kelvin > 8000 K → floor 0.40 (cold overcast: let adaptive correction handle it)
+        //   sunset           → 1.20 boost (golden hour deserves stronger gold toning)
+        //   night            → 0.40 (minimal — reduce colour noise risk in shadows)
+        let toneStrength: CGFloat = {
+            if scene.isNight  { return 0.40 }
+            if scene.isSunset { return 1.20 }
+            let rise = smoothstep(lo: 3200, hi: 5000, t: scene.kelvin)
+            let fall = 1.0 - smoothstep(lo: 6000, hi: 8000, t: scene.kelvin)
+            return (rise * fall).clamped(to: 0.40...1.20)
+        }()
+        let vgToneOut = applyVGToneCurve(to: baseImage, strength: toneStrength)
 
         // ── 2. Film tone curve ───────────────────────────────────────────────
-        guard let toneFilter = CIFilter(name: "CIToneCurve") else { return matOut }
-        toneFilter.setValue(matOut, forKey: kCIInputImageKey)
+        guard let toneFilter = CIFilter(name: "CIToneCurve") else { return vgToneOut }
+        toneFilter.setValue(vgToneOut, forKey: kCIInputImageKey)
         toneFilter.setValue(CIVector(x: 0.00, y: 0.000), forKey: "inputPoint0")
         toneFilter.setValue(CIVector(x: 0.25, y: 0.210), forKey: "inputPoint1")
         toneFilter.setValue(CIVector(x: 0.50, y: 0.500), forKey: "inputPoint2")
         toneFilter.setValue(CIVector(x: 0.75, y: 0.780), forKey: "inputPoint3")
         toneFilter.setValue(CIVector(x: 1.00, y: 0.940), forKey: "inputPoint4")
-        guard let toneOut = toneFilter.outputImage else { return matOut }
+        guard let toneOut = toneFilter.outputImage else { return vgToneOut }
 
-        // ── 2b. RY Atmosphere LUT — per-hue colour remap ─────────────────────
+        // ── 3. VG Atmosphere LUT ─────────────────────────────────────────────
         //
-        // A 33³ CIColorCube built once in ryAtmosphereLUT() and applied post
-        // tone-curve (perceptually balanced values).  Each hue band gets its
-        // own shift + saturation/value multiplier:
-        //
-        //   red/orange/yellow → warmer, more saturated (film amber)
-        //   green             → warmer, more vibrant
-        //   cyan  (165–200°)  → shifted −10° toward pure blue  ← sky/water fix
-        //   blue              → richer cobalt (+3°, sat ×1.10)
-        //   magenta           → suppressed (sat ×0.96)         ← overflow fix
+        // A 33³ CIColorCube built once in vgAtmosphereLUT() and applied post
+        // tone-curve.  Key differences from old RY LUT:
+        //   green (120–165°): 0° hue shift + ×1.10 sat  ← protection, stays green
+        //   cyan  (165–200°): −3° shift (was −10°)       ← water reflection guard
+        //   warm hues: lighter saturation push for more natural skin tones
         //
         // Night scenes skip the LUT to avoid amplifying colour noise.
         let lutOut: CIImage
         if !scene.isNight,
-           let lutData = ryAtmosphereLUT(),
+           let lutData = vgAtmosphereLUT(),
            let cube = CIFilter(name: "CIColorCube") {
-            cube.setValue(ryLUTDim, forKey: "inputCubeDimension")
+            cube.setValue(vgLUTDim, forKey: "inputCubeDimension")
             cube.setValue(lutData,  forKey: "inputCubeData")
             cube.setValue(toneOut,  forKey: kCIInputImageKey)
             lutOut = cube.outputImage ?? toneOut
@@ -286,21 +273,18 @@ enum ColorProcessor {
             lutOut = toneOut
         }
 
-        // ── 3. Adaptive saturation ────────────────────────────────────────────
+        // ── 4. Adaptive saturation ────────────────────────────────────────────
         //
-        // Scene satScore drives the output saturation:
-        //   Gray/dull (satScore ~ 0.0) → targetSat up to 1.06 (lift colour)
-        //   Already vivid (satScore ~ 1.0) → targetSat ~ 0.84 (leave alone)
-        //
-        // Night cap: capped at 0.86 to avoid amplifying noise as coloured grain.
-        // Sunset boost: + 0.05 to enrich golden colours.
-        let targetSat = (0.84 + (1.0 - scene.satScore) * 0.22)
-            .clamped(to: 0.76...1.10)
+        // Slightly higher floor (0.86 vs 0.84) and narrower boost range than old RY —
+        // VG's tone curve already contributes colour richness via the highlight-gold push,
+        // so we need less saturation boost to avoid over-saturating skies and foliage.
+        let targetSat = (0.86 + (1.0 - scene.satScore) * 0.18)
+            .clamped(to: 0.78...1.10)
         let finalSat: CGFloat
         if scene.isNight {
             finalSat = min(targetSat, 0.86)
         } else if scene.isSunset {
-            finalSat = min(targetSat + 0.05, 1.12)
+            finalSat = min(targetSat + 0.04, 1.10)
         } else {
             finalSat = targetSat
         }
@@ -310,77 +294,85 @@ enum ColorProcessor {
         satFilter.setValue(finalSat, forKey: kCIInputSaturationKey)
         satFilter.setValue(0.0,      forKey: kCIInputBrightnessKey)
         satFilter.setValue(1.0,      forKey: kCIInputContrastKey)
-        let satOut = satFilter.outputImage ?? toneOut
-
-        // ── 4. Split toning (CIColorPolynomial) ──────────────────────────────
-        //
-        // Shadows: slight cool/blue lean (0, -0.01, +0.008) — film-like cool depth
-        // Highlights: slight warm/orange lean (+0.010, -0.003, -0.010) — golden air
-        //
-        // CIColorPolynomial: out = a + b·in + c·in² + d·in³
-        //   At in=0 (black):   out ≈ a      → shadow tint
-        //   At in=1 (white):   out = a+b+c+d → shadow tint + linear + highlight delta
-        //   For identity: a=0, b=1, c=0, d=0
-        //   For shadow-only shift a: a + b=1, c=0, d=0 → dark pixels shift by a ✓
-        //   For highlight-only shift h: a=0, b=1, c=0, d=h (cubic: near 0 for darks, ~h for whites) ✓
-        //
-        // Strength is gated — night/fog skip split toning (noise risk).
-        let splitOut: CIImage
-        if !scene.isNight, !scene.isFoggy,
-           let poly = CIFilter(name: "CIColorPolynomial") {
-            let strength: CGFloat = scene.isSunset ? 1.4 : 1.0
-            // Shadow R: slightly cool (small negative shadow push)
-            let sR: CGFloat = -0.010 * strength
-            // Shadow B: slightly cool (small positive → bluer shadows)
-            let sB: CGFloat =  0.008 * strength
-            // Highlight R delta above identity
-            let hR: CGFloat =  0.012 * strength
-            // Highlight B delta above identity
-            let hB: CGFloat = -0.010 * strength
-
-            poly.setValue(satOut, forKey: kCIInputImageKey)
-            poly.setValue(CIVector(x: sR,  y: 1.0, z: 0.0, w: hR - sR),
-                          forKey: "inputRedCoefficients")
-            poly.setValue(CIVector(x: 0.0, y: 1.0, z: 0.0, w: 0.0),
-                          forKey: "inputGreenCoefficients")
-            poly.setValue(CIVector(x: sB,  y: 1.0, z: 0.0, w: hB - sB),
-                          forKey: "inputBlueCoefficients")
-            poly.setValue(CIVector(x: 0.0, y: 1.0, z: 0.0, w: 0.0),
-                          forKey: "inputAlphaCoefficients")
-            splitOut = poly.outputImage ?? satOut
-        } else {
-            splitOut = satOut
-        }
+        let satOut = satFilter.outputImage ?? lutOut
 
         // ── 5. Dynamic bloom ─────────────────────────────────────────────────
         //
-        // Bloom intensity is not fixed — it responds to the scene:
-        //   Hot highlights (sky/sun > 0.65 lum proxy) → attenuate (avoid blown halos)
-        //   Flat/dull scene (low satScore, not foggy)  → boost (add depth and air)
-        //   Night                                      → skip (glare noise amplification)
+        // Slightly reduced intensity floor vs old RY (0.12 base vs 0.14) — the VG
+        // tone curve's highlight push is more refined than bloom-as-glow, so we let
+        // the curve do the heavy lifting and keep bloom as a subtle air/halation effect.
         let bloomOut: CIImage
         if !scene.isNight, let bloomFilter = CIFilter(name: "CIBloom") {
             let highlightDamp: CGFloat = scene.highlightRatio > 0.65
                 ? (1.0 - ((scene.highlightRatio - 0.65) / 0.35)).clamped(to: 0.25...1.0)
                 : 1.0
-            let flatBoost: CGFloat = (scene.satScore < 0.15 && !scene.isFoggy) ? 1.25 : 1.0
-            let bloomIntensity = (0.14 * highlightDamp * flatBoost).clamped(to: 0.04...0.22)
+            let flatBoost: CGFloat = (scene.satScore < 0.15 && !scene.isFoggy) ? 1.20 : 1.0
+            let bloomIntensity = (0.12 * highlightDamp * flatBoost).clamped(to: 0.04...0.20)
 
-            bloomFilter.setValue(splitOut,       forKey: kCIInputImageKey)
+            bloomFilter.setValue(satOut,         forKey: kCIInputImageKey)
             bloomFilter.setValue(10.0,           forKey: kCIInputRadiusKey)
             bloomFilter.setValue(bloomIntensity, forKey: kCIInputIntensityKey)
-            bloomOut = bloomFilter.outputImage ?? splitOut
+            // IMPORTANT: CIBloom expands the output extent by `radius` on every side.
+            // Crop back to source extent to remove the overflow edge; the black frame
+            // composite in CameraManager.handleCapturedPhoto adds the intentional dark border.
+            bloomOut = (bloomFilter.outputImage ?? satOut).cropped(to: satOut.extent)
         } else {
-            bloomOut = splitOut
+            bloomOut = satOut
         }
 
         // ── 6. Scene-adaptive correction ─────────────────────────────────────
         return applyAdaptiveCorrection(to: bloomOut, scene: scene)
     }
 
-    // MARK: - Adaptive Correction (expanded scene coverage)
+    // MARK: - VG Tone Curve (CIColorPolynomial)
 
-    /// Per-scene fine-tuning applied AFTER the main colour grade.
+    /// Luminance-separated gold toning — the defining VG aesthetic stage.
+    ///
+    /// Pentax Gold / Kodak Gold 200 signature:
+    ///   • Shadows lean cool-blue  (film depth, dark separation from midtones)
+    ///   • Midtones pass through naturally (faithful subject rendering, accurate skin)
+    ///   • Highlights lean warm-gold (the "gold" in Kodak Gold 200, Pentax Gold)
+    ///
+    /// Unlike the old RY global warm matrix (which equally warmed all tones and produced
+    /// flat muddy shadows), CIColorPolynomial applies different tints at different
+    /// luminance levels — giving the graduated warm-gold characteristic that made
+    /// Kodak Gold 200 a beloved portrait / street / travel film.
+    ///
+    /// CIColorPolynomial: out = a + b·in + c·in² + d·in³
+    ///   a = constant offset — shadow bias (output at in=0)
+    ///   b = linear slope   — identity = 1.0
+    ///   c = quadratic term — set to 0 for smooth cubic response
+    ///   d = cubic term     — set to (highlight_net_delta − a)
+    ///       ensures at in=1: a + 1.0 + 0 + (h−a) = 1.0 + h ✓
+    private static func applyVGToneCurve(to image: CIImage, strength: CGFloat) -> CIImage {
+        guard let poly = CIFilter(name: "CIColorPolynomial") else { return image }
+        let s = strength
+
+        // Shadow push at in ≈ 0 (dark pixels):
+        let sR: CGFloat = -0.012 * s    // R−: cooler, less red in shadows
+        let sG: CGFloat = -0.005 * s    // G−: subtle green pull (reinforces cool cast)
+        let sB: CGFloat =  0.014 * s    // B+: blue depth in shadows
+
+        // Highlight net delta above identity at in = 1 (bright pixels):
+        let hR: CGFloat =  0.018 * s    // R+: golden warmth in highlights
+        let hG: CGFloat =  0.008 * s    // G+: slight green lift (gold, not just orange)
+        let hB: CGFloat = -0.018 * s    // B−: removes cyan from highlights → pure gold
+
+        poly.setValue(image, forKey: kCIInputImageKey)
+        poly.setValue(CIVector(x: sR, y: 1.0, z: 0.0, w: hR - sR),
+                      forKey: "inputRedCoefficients")
+        poly.setValue(CIVector(x: sG, y: 1.0, z: 0.0, w: hG - sG),
+                      forKey: "inputGreenCoefficients")
+        poly.setValue(CIVector(x: sB, y: 1.0, z: 0.0, w: hB - sB),
+                      forKey: "inputBlueCoefficients")
+        poly.setValue(CIVector(x: 0.0, y: 1.0, z: 0.0, w: 0.0),
+                      forKey: "inputAlphaCoefficients")
+        return poly.outputImage ?? image
+    }
+
+    // MARK: - Adaptive Correction (VG-updated scene coverage)
+
+    /// Per-scene fine-tuning applied AFTER the main VG grade.
     ///
     /// Priority order (first match wins — scenes are mutually exclusive at thresholds):
     ///   0. Degenerate / single-colour fallback
@@ -388,11 +380,12 @@ enum ColorProcessor {
     ///   2. Sunset / sunrise (warm, DO NOT counter-correct)
     ///   3. Fog / haze
     ///   4. Rain / snow
-    ///   5. Backlit subject (shadow lift only)
-    ///   6. Overcast / cold
-    ///   7. Green-dominant (foliage, parks)
-    ///   8. Warm indoor / tungsten
-    ///   9. Standard neutral — fine-tune toward reference 4593 K
+    ///   5. Water / lake / ocean (new in VG — protect blue-cool reflections)
+    ///   6. Backlit subject (shadow lift only)
+    ///   7. Overcast / cold
+    ///   8. Green-dominant (lighter than RY — VG LUT already protects foliage)
+    ///   9. Warm indoor / tungsten
+    ///  10. Standard neutral — fine-tune toward reference 4593 K
     private static func applyAdaptiveCorrection(to image: CIImage,
                                                  scene: SceneAnalysis) -> CIImage {
 
@@ -402,8 +395,7 @@ enum ColorProcessor {
         let avgG      = scene.avgG
         let avgB      = scene.avgB
 
-        // Shared scale that damps ALL corrections near extreme brightness values,
-        // where the pipeline already operates at its limits.
+        // Shared scale that damps ALL corrections near extreme brightness values.
         let correctionScale: CGFloat = {
             if luminance < 0.18 { return (luminance / 0.18).clamped(to: 0...1) }
             if luminance > 0.70 { return (1.0 - (luminance - 0.70) / 0.30).clamped(to: 0...1) }
@@ -414,14 +406,12 @@ enum ColorProcessor {
         let maxC = max(avgR, avgG, avgB)
         let minC = min(avgR, avgG, avgB)
         if maxC < 0.03 || (maxC - minC) < 0.015 {
-            // Near-black or near-monochrome — skip colour corrections to avoid
-            // introducing visible tints into what is effectively a grey image.
             return image
         }
 
         // ── 1. Night / very low light ─────────────────────────────────────────
-        // Slightly lift the black point in all three channels so pure-black noise
-        // doesn't crush to digital black.  Warmth is already attenuated upstream.
+        // Slightly lift the black point so pure-black noise doesn't crush to digital black.
+        // VG bias: warm-neutral (matches the golden-blue split in the tone curve at low lum).
         if scene.isNight {
             guard let mat = CIFilter(name: "CIColorMatrix") else { return image }
             mat.setValue(image, forKey: kCIInputImageKey)
@@ -429,28 +419,25 @@ enum ColorProcessor {
             mat.setValue(CIVector(x: 0, y: 1.0, z: 0, w: 0), forKey: "inputGVector")
             mat.setValue(CIVector(x: 0, y: 0, z: 1.0, w: 0), forKey: "inputBVector")
             mat.setValue(CIVector(x: 0, y: 0, z: 0,   w: 1), forKey: "inputAVector")
-            // Warm-neutral black-point lift: prevents total crush in deep shadows
-            mat.setValue(CIVector(x: 0.012, y: 0.009, z: 0.007, w: 0),
+            mat.setValue(CIVector(x: 0.010, y: 0.008, z: 0.008, w: 0),
                          forKey: "inputBiasVector")
             return mat.outputImage ?? image
         }
 
         // ── 2. Sunset / sunrise ───────────────────────────────────────────────
-        // The dynamic warm matrix already captured the golden light.  This pass
-        // enriches saturation slightly rather than counter-correcting warmth —
-        // the classic mistake that turns golden hour into a grey soup.
+        // The VG tone curve already captured the golden light.  This pass enriches
+        // saturation slightly — reduced vs old RY (1.10→1.06) since the tone curve
+        // already adds rich gold colour without needing a separate saturation spike.
         if scene.isSunset {
             guard let sat = CIFilter(name: "CIColorControls") else { return image }
             sat.setValue(image, forKey: kCIInputImageKey)
-            sat.setValue(1.10, forKey: kCIInputSaturationKey)
+            sat.setValue(1.06, forKey: kCIInputSaturationKey)
             sat.setValue(0.0,  forKey: kCIInputBrightnessKey)
             sat.setValue(1.0,  forKey: kCIInputContrastKey)
             return sat.outputImage ?? image
         }
 
         // ── 3. Fog / haze ─────────────────────────────────────────────────────
-        // All channels are elevated uniformly.  Boost contrast and gently lower
-        // mid-tone brightness to simulate a simple dehaze pass.
         if scene.isFoggy {
             guard let cc = CIFilter(name: "CIColorControls") else { return image }
             cc.setValue(image, forKey: kCIInputImageKey)
@@ -461,9 +448,6 @@ enum ColorProcessor {
         }
 
         // ── 4. Rain / snow ────────────────────────────────────────────────────
-        // Cold, desaturated, moderate luminance.  A saturation + micro-contrast
-        // boost adds the "wet richness" that rainy-day shots benefit from without
-        // pushing the palette toward the warm side.
         if scene.isRainSnow {
             guard let cc = CIFilter(name: "CIColorControls") else { return image }
             cc.setValue(image, forKey: kCIInputImageKey)
@@ -473,10 +457,26 @@ enum ColorProcessor {
             return cc.outputImage ?? image
         }
 
-        // ── 5. Backlit subject ────────────────────────────────────────────────
-        // Centre luminance is significantly below the full-image average — the
-        // subject is in silhouette against a bright background.  Lift shadows
-        // to recover subject detail; leave highlights intact.
+        // ── 5. Water / lake / ocean (new in VG) ──────────────────────────────
+        // Water scenes are cool and blue-dominant.  The VG tone curve pushes highlights
+        // gold, which is beautiful on light-sparkled water surfaces; however the green
+        // channel's slight shadow pull can occasionally shift deep water toward blue-grey.
+        // This pass subtly reinforces the blue depth and restores G channel neutrality
+        // so water stays properly blue-cool rather than teal-shifted.
+        if scene.isWaterScene {
+            guard let mat = CIFilter(name: "CIColorMatrix") else { return image }
+            mat.setValue(image, forKey: kCIInputImageKey)
+            mat.setValue(CIVector(x: 1.00, y: 0.0, z: 0.0, w: 0), forKey: "inputRVector")
+            mat.setValue(CIVector(x: 0.0, y: 0.98, z: 0.0, w: 0), forKey: "inputGVector")  // slight G pull
+            mat.setValue(CIVector(x: 0.0, y: 0.0, z: 1.02, w: 0), forKey: "inputBVector")  // slight B boost
+            mat.setValue(CIVector(x: 0.0, y: 0.0, z: 0.0,  w: 1), forKey: "inputAVector")
+            // Cool shadow bias: reinforce water depth without pushing cyan
+            mat.setValue(CIVector(x: -0.004, y: -0.002, z: 0.006, w: 0),
+                         forKey: "inputBiasVector")
+            return mat.outputImage ?? image
+        }
+
+        // ── 6. Backlit subject ────────────────────────────────────────────────
         if scene.isBacklit {
             let centerL = 0.2126 * avgR + 0.7152 * avgG + 0.0722 * avgB
             let lift = min(0.05, max(0, (0.55 - centerL / 0.55)) * 0.05)
@@ -490,34 +490,32 @@ enum ColorProcessor {
             return mat.outputImage ?? image
         }
 
-        // ── 6. Overcast / cold ────────────────────────────────────────────────
+        // ── 7. Overcast / cold ────────────────────────────────────────────────
         if kelvin > 6800 && luminance >= 0.18 && luminance <= 0.70 {
             return applyOvercastEnhancement(to: image, luminance: luminance)
         }
 
-        // ── 7. Green-dominant (foliage, parks, gardens) ───────────────────────
-        // The base warm matrix's B-reduction can push green leaves toward
-        // yellow-khaki.  Restore B and gently pull R back.
-        let midRB  = (avgR + avgB) / 2.0
-        let gRatio = midRB > 0.01 ? avgG / midRB : 1.0
-        if gRatio > 1.25 && avgG > 0.18 {
-            let strength = min(1.0, (gRatio - 1.25) / 0.75) * correctionScale
+        // ── 8. Green-dominant (foliage, parks, gardens) ───────────────────────
+        // VG's vgAtmosphereLUT already protects green (0° hue shift, ×1.10 sat),
+        // so only a lighter corrective touch is needed here vs old RY.
+        // Specifically: smaller R pull-back (0.02 vs 0.04) and smaller B lift (0.04 vs 0.07)
+        // to avoid over-correcting what the LUT already handled.
+        if scene.gRatio > 1.25 && avgG > 0.18 {
+            let strength = min(1.0, (scene.gRatio - 1.25) / 0.75) * correctionScale
             guard let mat = CIFilter(name: "CIColorMatrix") else { return image }
             mat.setValue(image, forKey: kCIInputImageKey)
-            mat.setValue(CIVector(x: 1.0 - 0.04 * strength, y: 0.0, z: 0.0, w: 0),
+            mat.setValue(CIVector(x: 1.0 - 0.02 * strength, y: 0.0, z: 0.0, w: 0),
                          forKey: "inputRVector")
             mat.setValue(CIVector(x: 0.0, y: 1.0, z: 0.0, w: 0), forKey: "inputGVector")
-            mat.setValue(CIVector(x: 0.0, y: 0.0, z: 1.0 + 0.07 * strength, w: 0),
+            mat.setValue(CIVector(x: 0.0, y: 0.0, z: 1.0 + 0.04 * strength, w: 0),
                          forKey: "inputBVector")
             mat.setValue(CIVector(x: 0.0, y: 0.0, z: 0.0, w: 1), forKey: "inputAVector")
             return mat.outputImage ?? image
         }
 
-        // ── 8. Warm indoor / tungsten / golden-hour interior ─────────────────
-        // The base matrix applied R×(1+0.05·warmStrength) unconditionally.  On
-        // scenes already warm (kelvin < 4000) the matrix already backed off via
-        // the bell curve, but some residual warm push may remain.  This provides
-        // a further smooth counter-correction proportional to remaining warmth.
+        // ── 9. Warm indoor / tungsten / golden-hour interior ─────────────────
+        // VG's tone curve has a reduced strength at kelvin < 3200 (bell curve floor),
+        // but residual warmth may remain.  Smooth counter-correction as before.
         if kelvin < 4000 {
             let w = min(0.40, (4000 - kelvin) / 3333.0) * correctionScale
             guard let mat = CIFilter(name: "CIColorMatrix") else { return image }
@@ -529,8 +527,7 @@ enum ColorProcessor {
             return mat.outputImage ?? image
         }
 
-        // ── 9. Standard neutral scene ─────────────────────────────────────────
-        // Fine-tune toward the 4593 K calibration reference.
+        // ── 10. Standard neutral scene ────────────────────────────────────────
         let referenceKelvin: CGFloat = 4593.0
         let kelvinDelta      = kelvin - referenceKelvin
         let blueAdjust       = (-kelvinDelta / 5000.0 * 0.04).clamped(to: -0.04...0.04)
@@ -550,10 +547,6 @@ enum ColorProcessor {
     // MARK: - Overcast Enhancement
 
     /// Deep, oil-paint treatment for flat overcast / cloudy scenes.
-    ///
-    ///   • Saturation +34% — lifts the muted palette into vivid richness
-    ///   • G/B depth matrix — cobalt blues, bottle-green foliage, amber accents
-    ///   • B-from-G cross-pull (−0.02·G) — removes residual cyan from blues
     private static func applyOvercastEnhancement(to image: CIImage,
                                                   luminance: CGFloat) -> CIImage {
         guard let satFilter = CIFilter(name: "CIColorControls") else { return image }
@@ -577,12 +570,6 @@ enum ColorProcessor {
     // MARK: - 105mm Enhancement
 
     /// Telephoto-specific noise reduction + saturation lift.
-    ///
-    /// Telephoto lenses optically compress contrast and render colour flatter;
-    /// the saturation lift compensates without affecting luminance.
-    /// Sharpening is deferred to the universal post-upscale pipeline in
-    /// CameraManager (CISharpenLuminance at 0.30 after CIBicubicScaleTransform)
-    /// to guarantee correct colour-then-sharpen ordering.
     private static func apply105mmEnhancement(to image: CIImage) -> CIImage {
         guard let noiseFilter = CIFilter(name: "CINoiseReduction") else { return image }
         noiseFilter.setValue(image, forKey: kCIInputImageKey)
@@ -598,20 +585,24 @@ enum ColorProcessor {
         return satFilter.outputImage ?? denoised
     }
 
-    // MARK: - RY Atmosphere LUT
+    // MARK: - VG Atmosphere LUT
 
     /// Builds (on first call) and caches a 33³ CIColorCube that encodes the full
-    /// RY per-hue atmosphere remap.  All transforms happen in HSV space so every
-    /// hue band receives an independent shift, saturation multiplier, and optional
-    /// value compensation — enabling a coherent "film atmosphere" rather than a
-    /// simple channel matrix.
+    /// VG per-hue atmosphere remap.  All transforms happen in HSV space.
     ///
-    /// Call this from the filter pipeline; it returns `nil` only on OOM failure
-    /// (in practice, 35 937 × 4 × Float = ~560 KB — always succeeds).
-    static func ryAtmosphereLUT() -> Data? {
-        if let d = ryLUTCache { return d }
+    /// Key VG design differences vs old RY LUT:
+    ///   • Green (120–165°): 0° hue shift + ×1.10 saturation
+    ///     → foliage / grass / leaves stay genuinely green (RY pushed them warm/khaki)
+    ///   • Cyan (165–200°): only −3° shift (RY was −10°)
+    ///     → water reflections, pool surfaces, humid sky preserved; not over-shifted blue
+    ///   • Red / orange / yellow: slightly lighter saturation push (×1.04–1.08 vs ×1.05–1.10)
+    ///     → more natural skin tones; the VG tone curve already enriches warm highlights
+    ///   • Skin-tone dual protection: hue 15–42°, S<0.58, V>0.48 → satMult capped at 1.02
+    ///   • Dull-colour lift + vivid-highlight clamp (same as RY, unchanged)
+    static func vgAtmosphereLUT() -> Data? {
+        if let d = vgLUTCache { return d }
 
-        let dim   = ryLUTDim
+        let dim   = vgLUTDim
         let total = dim * dim * dim * 4
         var cube  = [Float](repeating: 0, count: total)
 
@@ -637,16 +628,17 @@ enum ColorProcessor {
                         h *= 60.0
                     }
 
-                    // Per-hue atmosphere mapping
-                    let (newH, sMult, vMult) = ryHueMap(hue: h)
+                    // Per-hue VG atmosphere mapping
+                    let (newH, sMult, vMult) = vgHueMap(hue: h)
 
-                    // Skin-tone protection: orange range, moderate sat, bright value
-                    // Prevent over-warming portrait skin (hue 15–42°, S < 0.58, V > 0.48)
+                    // Skin-tone dual protection: orange-range, moderate sat, bright value
+                    // Prevents over-warming portrait skin (VG's warm highlights already
+                    // enhance skin in the tone curve — the LUT should preserve, not stack)
                     let isSkin  = h >= 15 && h < 42 && s < 0.58 && v > 0.48
                     let effSM   = isSkin ? min(sMult, 1.02) : sMult
 
                     // Dull-colour lift: push grey/overcast tones toward richness
-                    let lowBoost: Float = s < 0.20 ? 1.0 + (0.20 - s) / 0.20 * 0.12 : 1.0
+                    let lowBoost: Float = s < 0.20 ? 1.0 + (0.20 - s) / 0.20 * 0.10 : 1.0
 
                     // Vivid-highlight clamp: don't blow already-saturated highlights
                     let hiClamp: Float  = (v > 0.85 && s > 0.70) ? 0.97 : 1.0
@@ -665,34 +657,35 @@ enum ColorProcessor {
             }
         }
 
-        ryLUTCache = Data(bytes: cube, count: total * MemoryLayout<Float>.size)
-        return ryLUTCache
+        vgLUTCache = Data(bytes: cube, count: total * MemoryLayout<Float>.size)
+        return vgLUTCache
     }
 
-    /// Per-hue mapping for the RY atmosphere LUT.
+    /// Per-hue mapping for the VG atmosphere LUT.
     /// Returns (new hue °, saturation multiplier, value multiplier).
     ///
-    /// Design rationale:
-    ///   • Warm hues (red/orange/yellow): modest hue push toward richer gold/amber +
-    ///     saturation lift → produces the classic "RY warm film" look.
-    ///   • Greens: slight warm push + saturation lift → lush foliage without
-    ///     going yellow-khaki (the B-reduction problem in the warm matrix).
-    ///   • Cyan (165–200°): large hue shift −10° toward pure blue, plus saturation
-    ///     boost and value recovery → fixes sky turning cyan and water turning green.
-    ///   • Blue: slight purple-ward push + brightness lift → rich cobalt/sapphire.
-    ///   • Magenta: no hue shift, sat ×0.96 → suppresses overflow bleeding.
-    private static func ryHueMap(hue: Float) -> (Float, Float, Float) {
+    /// VG design rationale vs old RY:
+    ///   • Warm hues (red/orange/yellow): lighter sat push — VG tone curve handles warmth;
+    ///     LUT adds refining amber shift without stacking on top of the tone curve gold.
+    ///   • Green (120–165°): 0° shift + ×1.10 sat — THE key VG green protection.
+    ///     Old RY pushed green +2° (slightly warm/khaki); VG keeps foliage green and lush.
+    ///   • Cyan (165–200°): −3° (OLD: −10°) — water reflection guard.
+    ///     The large −10° shift turned pool water and humid sky unrealistically blue.
+    ///     −3° gently removes cyan channel overflow without destroying water colour.
+    ///   • Blue: similar cobalt push (same as RY — cobalt blue is a VG signature too)
+    ///   • Magenta: ×0.95 sat suppress — prevent colour overflow bleeding
+    private static func vgHueMap(hue: Float) -> (Float, Float, Float) {
         let h = (hue.truncatingRemainder(dividingBy: 360) + 360)
                  .truncatingRemainder(dividingBy: 360)
-        if      h <  20 { return (h +  5.0, 1.05, 1.00) }   // red      → warm orange-red
-        else if h <  50 { return (h +  3.5, 1.08, 1.02) }   // orange   → rich amber-orange
-        else if h <  75 { return (h +  4.5, 1.10, 1.02) }   // yellow   → golden amber
-        else if h < 120 { return (h -  2.5, 1.05, 1.00) }   // yel-grn  → kept vibrant green
-        else if h < 165 { return (h +  2.0, 1.06, 0.99) }   // green    → warm lush green
-        else if h < 200 { return (h - 10.0, 1.14, 1.03) }   // cyan     → pure blue (sky fix)
-        else if h < 255 { return (h +  3.0, 1.10, 1.04) }   // blue     → rich cobalt
-        else if h < 310 { return (h -  4.0, 1.03, 0.99) }   // purple   → deeper violet
-        else            { return (h +  0.0, 0.96, 1.00) }   // magenta  → suppress overflow
+        if      h <  20 { return (h + 4.0, 1.04, 1.00) }   // red       → warm orange-red
+        else if h <  50 { return (h + 3.0, 1.06, 1.01) }   // orange    → rich amber-orange
+        else if h <  75 { return (h + 3.5, 1.08, 1.01) }   // yellow    → golden amber
+        else if h < 120 { return (h + 0.0, 1.05, 1.00) }   // yel-grn   → GREEN PROTECT (0° shift)
+        else if h < 165 { return (h + 1.0, 1.10, 0.99) }   // green     → lush, vibrant green
+        else if h < 200 { return (h - 3.0, 1.08, 1.02) }   // cyan      → slight blue shift (water guard)
+        else if h < 255 { return (h + 3.0, 1.08, 1.03) }   // blue      → rich cobalt
+        else if h < 310 { return (h - 3.0, 1.02, 0.99) }   // purple    → deeper violet
+        else            { return (h + 0.0, 0.95, 1.00) }   // magenta   → suppress overflow
     }
 
     /// Float-precision HSV → RGB.  h in degrees [0, 360), s/v in [0, 1].
@@ -722,7 +715,6 @@ enum ColorProcessor {
     }
 
     /// Smooth Hermite interpolation from 0 at `lo` to 1 at `hi`.
-    /// Returns 0 below `lo`, 1 above `hi`, smooth S-curve in between.
     private static func smoothstep(lo: CGFloat, hi: CGFloat, t: CGFloat) -> CGFloat {
         let x = ((t - lo) / (hi - lo)).clamped(to: 0...1)
         return x * x * (3.0 - 2.0 * x)

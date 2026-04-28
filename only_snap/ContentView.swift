@@ -14,8 +14,32 @@ struct ContentView: View {
     @State private var selectedFormat: AspectFormat = .threeToFour
     @State private var shutterProgress: CGFloat      = 0
 
+    // Device orientation — drives icon rotation and camera videoRotationAngle.
+    // The INTERFACE orientation is always portrait (locked in only_snapApp.swift).
+    // Only icons/text and the camera feed content respond to device orientation;
+    // the layout itself never changes, so AVCaptureVideoPreviewLayer is never
+    // inside a transformed hierarchy (which would break the XPC link → err=-17281).
+    @State private var deviceOrientation: UIDeviceOrientation = UIDevice.current.orientation
+
     private let focals = [21, 35, 50, 105]
     private let haptic = UIImpactFeedbackGenerator(style: .rigid)
+
+    // MARK: - Orientation helpers
+
+    /// Rotation to apply to individual icons/text so they appear upright
+    /// when the device is held in landscape (left only — right is ignored).
+    private var iconRotation: Angle {
+        deviceOrientation == .landscapeLeft ? .degrees(90) : .degrees(0)
+    }
+
+    /// True when device is held landscape-left.
+    private var isDeviceLandscape: Bool {
+        deviceOrientation == .landscapeLeft
+    }
+
+    /// The `videoRotationAngle` for the preview layer when landscape.
+    /// Only landscapeLeft is supported (0°); landscapeRight is filtered out in onReceive.
+    private var landscapeRotationAngle: CGFloat { 0 }
 
     // MARK: - Body
     var body: some View {
@@ -23,29 +47,40 @@ struct ContentView: View {
             let sw   = screen.size.width
             let sh   = screen.size.height
             let safe = screen.safeAreaInsets
-            let isLandscape = sw > sh
 
             ZStack {
                 Theme.Colors.background.ignoresSafeArea()
-                if isLandscape {
-                    landscapeLayout(sw: sw, sh: sh, safe: safe)
-                } else {
-                    VStack(spacing: 0) {
-                        viewfinderBlock(
-                            screenWidth: sw,
-                            screenHeight: sh,
-                            safeTop: safe.top
-                        )
-                        Spacer(minLength: 0)
-                        controlsBlock
-                    }
-                    .offset(y: -35)
+                // Always portrait layout — never apply rotationEffect to this VStack.
+                // Device landscape is handled by individual icon rotation + camera angle.
+                VStack(spacing: 0) {
+                    viewfinderBlock(screenWidth: sw, screenHeight: sh, safeTop: safe.top)
+                    Spacer(minLength: 0)
+                    controlsBlock
                 }
+                .offset(y: -35)
             }
         }
         .ignoresSafeArea(edges: .bottom)
+        .onAppear {
+            // Must call this before UIDevice.current.orientation reports non-unknown values.
+            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        }
         .onDisappear {
+            UIDevice.current.endGeneratingDeviceOrientationNotifications()
             camera.stop()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIDevice.orientationDidChangeNotification)) { _ in
+            let o = UIDevice.current.orientation
+            // Only respond to portrait and landscape-left.
+            // landscapeRight is ignored: the development device only rotates left,
+            // and supporting both directions doubles the angle-correction complexity
+            // while landscapeRight (previewAngle=180°) is rarely needed in practice.
+            // portraitUpsideDown is also ignored (uncommon, no icon-rotation value).
+            guard o == .portrait || o == .landscapeLeft else { return }
+            withAnimation(.easeInOut(duration: 0.25)) {
+                deviceOrientation = o
+            }
         }
     }
 
@@ -88,16 +123,20 @@ struct ContentView: View {
                 .strokeBorder(Theme.Colors.bodyDark, lineWidth: 1.5)
                 .frame(width: vfWidth, height: vfHeight)
 
-            // Live preview + fallback background
+            // Live preview + fallback background.
+            // Black fill: the camera sensor is surrounded by black when letterboxed;
+            // using black here also hides any sub-pixel gap at the viewfinder edges
+            // that can appear due to fractional-point frame rounding on retina screens.
             RoundedRectangle(cornerRadius: 10)
-                .fill(Theme.Colors.viewfinderBg)
+                .fill(Color.black)
                 .frame(width: max(1, vfWidth - 12), height: max(1, vfHeight - 12))
                 .overlay(
                     PreviewView(session: camera.session,
                                 format: selectedFormat,
                                 isSessionRunning: camera.isSessionRunning,
                                 ryEnabled: experimentalColor,
-                                isLandscape: false,
+                                isLandscape: isDeviceLandscape,
+                                landscapeRotationAngle: landscapeRotationAngle,
                                 cameraManager: camera)
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 )
@@ -136,6 +175,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             focalRow
                 .padding(.bottom, L.focalToButtons + 10)
+                .offset(y: -5)
 
             ZStack(alignment: .center) {
                 shutterButton
@@ -164,10 +204,12 @@ struct ContentView: View {
                                 .font(.system(size: 15, weight: .regular))
                                 .foregroundColor(Theme.Colors.textSubtle)
                         }
+                        .rotationEffect(iconRotation)
                     } else {
                         Text("\(mm)")
                             .font(.system(size: 20, weight: .regular))
                             .foregroundColor(Theme.Colors.textMuted)
+                            .rotationEffect(iconRotation)
                     }
                 }
                 .buttonStyle(.plain)
@@ -193,6 +235,7 @@ struct ContentView: View {
                         Image(systemName: flashOn ? "bolt.fill" : "bolt.slash.fill")
                             .font(.system(size: 26, weight: .medium))
                             .foregroundColor(flashOn ? Theme.Colors.bodyDark : Theme.Colors.textMuted)
+                            .rotationEffect(iconRotation)
                     )
             }
             .buttonStyle(.plain)
@@ -216,10 +259,11 @@ struct ContentView: View {
                 .frame(width: L.btnSize, height: L.btnSize)
                 .overlay(Circle().strokeBorder(Theme.Colors.bodyDark, lineWidth: 2))
                 .overlay(
-                    Text("RY")
+                    Text("VG")
                         .font(.system(size: 21, weight: .medium))
                         .foregroundColor(Theme.Colors.bodyDark)
                         .kerning(0.5)
+                        .rotationEffect(iconRotation)
                 )
         } else {
             Circle()
@@ -230,6 +274,7 @@ struct ContentView: View {
                         .font(.system(size: 19, weight: .medium))
                         .foregroundColor(Theme.Colors.cream)
                         .kerning(1.0)
+                        .rotationEffect(iconRotation)
                 )
         }
     }
@@ -293,6 +338,8 @@ struct ContentView: View {
                         RoundedRectangle(cornerRadius: 6)
                             .strokeBorder(Theme.Colors.bodyDark, lineWidth: 1.5)
                     )
+                    // rotationEffect AFTER overlay so the border rotates with the text
+                    .rotationEffect(iconRotation)
             }
             .buttonStyle(.plain)
             .offset(y: -L.formatUpLift)
@@ -325,232 +372,6 @@ struct ContentView: View {
                 let newIdx = (idx + steps).clamped(to: 0...(all.count - 1))
                 if all[newIdx] != selectedFormat { switchFormat(to: all[newIdx]) }
             }
-    }
-
-    // MARK: - Gestures (Landscape)
-
-    /// Vertical drag on the focal column: swipe up → higher focal (105); swipe down → lower (21).
-    private var focalSwipeGestureVertical: some Gesture {
-        DragGesture(minimumDistance: 10)
-            .onChanged { value in
-                let steps = Int((-value.translation.height) / L.swipeThreshold)
-                guard steps != 0 else { return }
-                let idx    = focals.firstIndex(of: selectedFocal) ?? 1
-                let newIdx = (idx + steps).clamped(to: 0...(focals.count - 1))
-                if focals[newIdx] != selectedFocal { switchFocal(to: focals[newIdx]) }
-            }
-    }
-
-    /// Vertical drag on the format button: swipe up → next format; swipe down → previous.
-    private var formatSwipeGestureLandscape: some Gesture {
-        DragGesture(minimumDistance: 10)
-            .onChanged { value in
-                let steps = Int((-value.translation.height) / L.swipeThreshold)
-                guard steps != 0 else { return }
-                let all    = AspectFormat.allCases
-                let idx    = all.firstIndex(of: selectedFormat)!
-                let newIdx = (idx + steps).clamped(to: 0...(all.count - 1))
-                if all[newIdx] != selectedFormat { switchFormat(to: all[newIdx]) }
-            }
-    }
-
-    // MARK: - Landscape Layout
-
-    @ViewBuilder
-    private func landscapeLayout(sw: CGFloat, sh: CGFloat, safe: EdgeInsets) -> some View {
-        let leadPad  = max(safe.leading, 6)
-        let trailPad = max(safe.trailing, 6)
-        let stripW   = L.lsStripWidth
-        let vfW      = sw - leadPad - trailPad - stripW
-
-        HStack(spacing: 0) {
-            // Leading safe-area gap (notch / Dynamic Island side)
-            Spacer().frame(width: leadPad, height: sh)
-
-            // Viewfinder — explicit pixel dimensions
-            lsViewfinderBlock(w: vfW, h: sh)
-
-            // Controls strip — explicit size + cream background so it's never transparent
-            landscapeControlsStrip(safeBottom: safe.bottom)
-                .frame(width: stripW, height: sh)
-                .background(Theme.Colors.background)
-
-            // Trailing safe-area gap (home-indicator side)
-            Spacer().frame(width: trailPad, height: sh)
-        }
-        .frame(width: sw, height: sh)
-    }
-
-    private func lsViewfinderBlock(w: CGFloat, h: CGFloat) -> some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Theme.Colors.viewfinderBg)
-            PreviewView(session: camera.session,
-                        format: selectedFormat,
-                        isSessionRunning: camera.isSessionRunning,
-                        ryEnabled: experimentalColor,
-                        isLandscape: true,
-                        cameraManager: camera)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-            ZStack {
-                ViewfinderCorners()
-                CrosshairView()
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-            .allowsHitTesting(false)
-            if camera.permissionDenied {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(Color.black.opacity(0.75))
-                    .overlay(
-                        Text("Camera access required")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(.white)
-                    )
-            }
-        }
-        // Inner content with 6 pt inset; outer frame provides layout size
-        .frame(width: w - 12, height: h - 12)
-        .frame(width: w, height: h)
-    }
-
-    @ViewBuilder
-    private func landscapeControlsStrip(safeBottom: CGFloat) -> some View {
-        VStack(spacing: 0) {
-
-            // ── Format (top) ─────────────────────────────────────────────────
-            Button { switchFormat(to: selectedFormat.next()) } label: {
-                Text(selectedFormat.label)
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundColor(Theme.Colors.bodyDark)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 5)
-                            .strokeBorder(Theme.Colors.bodyDark, lineWidth: 1.5)
-                    )
-            }
-            .buttonStyle(.plain)
-            .gesture(formatSwipeGestureLandscape)
-            .padding(.top, L.lsVPad)
-
-            Spacer()
-
-            // ── Focal column: 105 at top → 21 at bottom ──────────────────────
-            VStack(alignment: .center, spacing: 9) {
-                ForEach(focals.reversed(), id: \.self) { mm in
-                    Button { switchFocal(to: mm) } label: {
-                        if mm == selectedFocal {
-                            HStack(alignment: .lastTextBaseline, spacing: 2) {
-                                Text("\(mm)")
-                                    .font(.system(size: 22, weight: .medium))
-                                    .foregroundColor(Theme.Colors.bodyDark)
-                                Text("mm")
-                                    .font(.system(size: 9, weight: .regular))
-                                    .foregroundColor(Theme.Colors.textSubtle)
-                            }
-                        } else {
-                            Text("\(mm)")
-                                .font(.system(size: 16, weight: .regular))
-                                .foregroundColor(Theme.Colors.textMuted)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .gesture(focalSwipeGestureVertical)
-
-            Spacer()
-
-            // ── Shutter ───────────────────────────────────────────────────────
-            Button {
-                guard camera.isSessionRunning else { return }
-                shutterProgress = 0
-                withAnimation(.linear(duration: 0.6)) { shutterProgress = 1 }
-                Task {
-                    await camera.capture(format: selectedFormat,
-                                         experimentalColor: experimentalColor)
-                }
-            } label: {
-                ZStack {
-                    // Invisible tap-target — preserves original hit area
-                    Circle()
-                        .fill(Color.clear)
-                        .frame(width: L.lsShutterOuter, height: L.lsShutterOuter)
-                    // Visual outer ring (−10%)
-                    Circle()
-                        .strokeBorder(Theme.Colors.bodyDark.opacity(0.25), lineWidth: 2)
-                        .frame(width: L.lsShutterOuter * 0.9, height: L.lsShutterOuter * 0.9)
-                    // Animated arc (−10%)
-                    Circle()
-                        .trim(from: 0, to: shutterProgress)
-                        .stroke(Theme.Colors.bodyDark,
-                                style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .frame(width: L.lsShutterOuter * 0.9, height: L.lsShutterOuter * 0.9)
-                        .rotationEffect(.degrees(-90))
-                    // Inner fill (−10%)
-                    Circle()
-                        .fill(Theme.Colors.bodyDark)
-                        .frame(width: L.lsShutterInner * 0.9, height: L.lsShutterInner * 0.9)
-                }
-            }
-            .buttonStyle(.plain)
-
-            Spacer()
-
-            // ── RY + Flash (bottom) ───────────────────────────────────────────
-            VStack(spacing: 8) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.18)) { experimentalColor.toggle() }
-                } label: {
-                    lsExpColorButton
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    flashOn.toggle()
-                    camera.setFlash(flashOn)
-                } label: {
-                    Circle()
-                        .fill(Theme.Colors.buttonFill)
-                        .frame(width: L.lsBtnSize, height: L.lsBtnSize)
-                        .overlay(Circle().strokeBorder(Theme.Colors.buttonBorder, lineWidth: 1))
-                        .overlay(
-                            Image(systemName: flashOn ? "bolt.fill" : "bolt.slash.fill")
-                                .font(.system(size: 20, weight: .medium))
-                                .foregroundColor(
-                                    flashOn ? Theme.Colors.bodyDark : Theme.Colors.textMuted)
-                        )
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.bottom, L.lsVPad + safeBottom)
-        }
-    }
-
-    @ViewBuilder
-    private var lsExpColorButton: some View {
-        if experimentalColor {
-            Circle()
-                .fill(Theme.Colors.cream)
-                .frame(width: L.lsBtnSize, height: L.lsBtnSize)
-                .overlay(Circle().strokeBorder(Theme.Colors.bodyDark, lineWidth: 1.5))
-                .overlay(
-                    Text("RY")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundColor(Theme.Colors.bodyDark)
-                        .kerning(0.5)
-                )
-        } else {
-            Circle()
-                .fill(Theme.Colors.rawFill)
-                .frame(width: L.lsBtnSize, height: L.lsBtnSize)
-                .overlay(
-                    Text("raw")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(Theme.Colors.cream)
-                        .kerning(1.0)
-                )
-        }
     }
 
     // MARK: - Helpers

@@ -13,7 +13,28 @@ struct PreviewView: UIViewRepresentable {
     let isSessionRunning: Bool
     let ryEnabled: Bool
     let isLandscape: Bool
+    /// The `videoRotationAngle` to use when `isLandscape` is true.
+    /// - landscapeLeft  → 0°   (sensor native)
+    /// - landscapeRight → 180° (sensor flipped 180°)
+    /// - portrait       → ignored (always 90°)
+    let landscapeRotationAngle: CGFloat
     let cameraManager: CameraManager   // routes session mutations through sessionQueue
+
+    init(session: AVCaptureSession,
+         format: AspectFormat,
+         isSessionRunning: Bool,
+         ryEnabled: Bool,
+         isLandscape: Bool,
+         landscapeRotationAngle: CGFloat = 0,
+         cameraManager: CameraManager) {
+        self.session               = session
+        self.format                = format
+        self.isSessionRunning      = isSessionRunning
+        self.ryEnabled             = ryEnabled
+        self.isLandscape           = isLandscape
+        self.landscapeRotationAngle = landscapeRotationAngle
+        self.cameraManager         = cameraManager
+    }
 
     func makeUIView(context: Context) -> RYPreviewUIView {
         let view = RYPreviewUIView()
@@ -23,7 +44,7 @@ struct PreviewView: UIViewRepresentable {
 
     func updateUIView(_ uiView: RYPreviewUIView, context: Context) {
         uiView.setRY(enabled: ryEnabled)
-        uiView.setLandscape(isLandscape)
+        uiView.setLandscape(isLandscape, rotationAngle: landscapeRotationAngle)
         if !uiView.bounds.isEmpty {
             uiView.setFormat(format, animated: true)
         }
@@ -54,9 +75,17 @@ final class RYPreviewUIView: UIView {
         // Process in extended-linear sRGB (float precision internally) before quantising
         // to the 8-bit Metal drawable.  This eliminates gradient banding ("mosaic") on
         // smooth areas such as sky because all CIFilter math runs at float resolution.
+        //
+        // cacheIntermediates: false — at 30 fps the intermediate CIImage textures are
+        // consumed immediately and never reused.  Without this flag CoreImage caches every
+        // intermediate GPU texture, growing the Metal heap unboundedly until iOS kills the
+        // process or XPC fails (malloc: xzm: failed to initialize deferred reclamation
+        // buffer → err=-17281).  Disabling caching trades a tiny amount of per-frame GPU
+        // recompute for a stable, bounded memory footprint.
         let opts: [CIContextOption: Any] = [
             .workingColorSpace: CGColorSpace(name: CGColorSpace.extendedLinearSRGB) as Any,
-            .useSoftwareRenderer: false
+            .useSoftwareRenderer: false,
+            .cacheIntermediates: false
         ]
         if let device = MTLCreateSystemDefaultDevice() {
             return CIContext(mtlDevice: device, options: opts)
@@ -76,6 +105,16 @@ final class RYPreviewUIView: UIView {
     // Orientation flag — set via setLandscape() from updateUIView.
     // Controls pixel-buffer rotation in captureOutput and previewLayer angle in layoutSubviews.
     private var isLandscape: Bool = false
+
+    // Tracks the last angle applied to the preview layer connection so setLandscape()
+    // can guard against redundant work.  updateUIView fires on every SwiftUI state
+    // change (including 60fps shutterProgress animation) — without this guard we'd
+    // set videoRotationAngle + run CATransaction on every animation frame.
+    private var lastLandscapeAngle: CGFloat = 90
+
+    // Guards setFormat() against the same 60fps updateUIView thrash.
+    private var lastMaskFormat: AspectFormat?
+    private var lastMaskBoundsSize: CGSize = .zero
 
     // Cached RY CIFilter instances — pre-warmed eagerly in enableRYMode() on videoQueue,
     // then reused every frame (videoQueue is serial, so all access is data-race-free).
@@ -101,23 +140,68 @@ final class RYPreviewUIView: UIView {
         // enableRYMode() can reveal it instantly without a DispatchQueue.main.async delay.
     }
 
+    // MARK: - Deallocation
+
+    /// Guarantees that `videoDataOutput` is removed from the session before the view dies.
+    ///
+    /// Without this, orientation transitions (which destroy and recreate the SwiftUI
+    /// UIViewRepresentable host) leave an orphaned AVCaptureVideoDataOutput attached to
+    /// the session with a delegate pointing at freed memory.  On the next frame delivery
+    /// AVFoundation attempts to call the dangling delegate, which corrupts the XPC link
+    /// to mediaserverd and produces cascading err=-17281 on all subsequent capturePhoto
+    /// calls for the lifetime of the process.
+    deinit {
+        if let output = videoDataOutput {
+            cameraManager?.removeVideoDataOutput(output)
+        }
+    }
+
     // MARK: - Landscape
 
     /// Called from PreviewView.updateUIView whenever the orientation changes.
-    func setLandscape(_ landscape: Bool) {
-        guard landscape != isLandscape else { return }
+    ///
+    /// `landscape` is true when the device is held landscape.
+    /// `rotationAngle` is the `videoRotationAngle` for the preview layer connection:
+    ///   portrait        → 90°
+    ///   landscapeLeft   →  0°  (sensor delivers landscape-left natively)
+    ///   landscapeRight  → 180° (flip 180°)
+    ///
+    /// updateUIView is called on the main thread on every SwiftUI state change
+    /// (including 60fps shutterProgress animation).  The guard on `lastLandscapeAngle`
+    /// ensures we only do real work when the orientation actually changes.
+    func setLandscape(_ landscape: Bool, rotationAngle: CGFloat = 90) {
+        let previewAngle: CGFloat = landscape ? rotationAngle : 90
+        // Guard: skip if the effective angle hasn't changed.
+        guard abs(previewAngle - lastLandscapeAngle) > 0.1 else { return }
+        lastLandscapeAngle = previewAngle
         isLandscape = landscape
-        // Update previewLayer rotation and recalculate format masks.
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            let angle: CGFloat = landscape ? 0 : 90
-            if let conn = self.previewLayer.connection,
-               conn.isVideoRotationAngleSupported(angle) {
-                conn.videoRotationAngle = angle
-            }
-            // Recalculate mask rects for the new orientation.
-            self.setFormat(self.currentFormat, animated: false)
+
+        // Update preview layer connection (90° portrait, 0/180° landscape).
+        if let conn = previewLayer.connection,
+           conn.isVideoRotationAngleSupported(previewAngle) {
+            conn.videoRotationAngle = previewAngle
         }
+
+        // Update video data output connection so the Metal RY path receives
+        // correctly oriented pixel buffers:
+        //   portrait  → 90° → portrait pixels   → fills portrait Metal layer directly
+        //   landscape →  0° → landscape pixels  → aspect-fill crops sides,
+        //                                          showing the landscape scene perspective
+        // Both landscapeLeft and landscapeRight use 0° for the data output because
+        // the Metal path only needs landscape vs portrait, not the handedness.
+        let dataAngle: CGFloat = landscape ? 0 : 90
+        if let output = videoDataOutput,
+           let conn = output.connection(with: .video),
+           conn.isVideoRotationAngleSupported(dataAngle) {
+            conn.videoRotationAngle = dataAngle
+        }
+
+        // Recalculate format masks for the new orientation.
+        // Bounds haven't changed (portrait-locked UI), but isLandscapeBounds inside
+        // setFormat reads bounds.width > bounds.height — still false in portrait layout.
+        // We reset lastMaskBoundsSize so setFormat re-runs its layout pass.
+        lastMaskBoundsSize = .zero
+        setFormat(currentFormat, animated: false)
     }
 
     // MARK: - RY toggle
@@ -139,6 +223,13 @@ final class RYPreviewUIView: UIView {
 
         // Create output first (no delegate yet — set inside addVideoDataOutput on sessionQueue).
         let output = AVCaptureVideoDataOutput()
+        // Only set pixel format — do NOT add kCVPixelBufferWidthKey / HeightKey here.
+        // With .photo session preset the session controls the output resolution internally;
+        // specifying explicit dimensions in videoSettings for a photo-preset session either
+        // silently prevents canAddOutput() from succeeding (so no frames are ever delivered)
+        // or conflicts with the session and breaks the RY/RAW toggle.
+        // The .photo preset already delivers ~1920×1440 frames to the video data output,
+        // which is sufficient for 30 fps Metal rendering at 3× retina screen sizes.
         output.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
@@ -146,24 +237,43 @@ final class RYPreviewUIView: UIView {
         videoDataOutput = output
 
         // Route session mutation through sessionQueue.
-        cameraManager.addVideoDataOutput(output, delegate: self, queue: videoQueue)
+        // Pass the current landscape state so the output connection is initialised
+        // with the correct videoRotationAngle right away — not always portrait-90°.
+        // (addVideoDataOutput runs on sessionQueue asynchronously; if we waited for
+        //  setLandscape to correct it afterwards, the connection wouldn't exist yet.)
+        let initialDataAngle: CGFloat = isLandscape ? 0 : 90
+        let previewAngle = lastLandscapeAngle   // capture before the async commit
+        cameraManager.addVideoDataOutput(output, delegate: self, queue: videoQueue,
+                                          initialDataAngle: initialDataAngle) { [weak self] in
+            // session.commitConfiguration() resets previewLayer.connection.videoRotationAngle
+            // back to 0° (sensor default).  Re-apply the correct angle here so the
+            // viewfinder doesn't rotate when RY mode is toggled.
+            guard let self = self,
+                  let conn = self.previewLayer.connection,
+                  conn.isVideoRotationAngleSupported(previewAngle) else { return }
+            conn.videoRotationAngle = previewAngle
+        }
 
-        // Pre-warm all CIFilter instances on videoQueue so the first few frames don't
-        // pay the lazy-init cost.  videoQueue is serial, so this is data-race-free.
+        // Pre-warm all CIFilter instances AND the RY atmosphere LUT on videoQueue so the
+        // first photo capture doesn't pay a memory-allocation spike mid-pipeline.
+        // videoQueue is serial, so all access is data-race-free.
         videoQueue.async { [weak self] in
             guard let self = self else { return }
+            // Pre-build the 33³ VG LUT cache (~560 KB, one-time cost) so the first capturePhoto
+            // call finds it already resident instead of allocating it during the photo pipeline.
+            _ = ColorProcessor.vgAtmosphereLUT()
             if self.cachedMatrixFilter == nil {
                 let f = CIFilter(name: "CIColorMatrix")
-                f?.setValue(CIVector(x:  1.05, y: 0.00, z: -0.03, w: 0), forKey: "inputRVector")
-                f?.setValue(CIVector(x:  0.00, y: 0.98, z: -0.03, w: 0), forKey: "inputGVector")
-                f?.setValue(CIVector(x: -0.04, y: 0.00, z:  0.90, w: 0), forKey: "inputBVector")
-                f?.setValue(CIVector(x:  0.00, y: 0.00, z:  0.00, w: 1), forKey: "inputAVector")
-                f?.setValue(CIVector(x: 0.006, y: 0.003, z: 0.000, w: 0), forKey: "inputBiasVector")
+                f?.setValue(CIVector(x:  1.02, y: 0.00, z: -0.010, w: 0), forKey: "inputRVector")
+                f?.setValue(CIVector(x:  0.00, y: 0.99, z: -0.005, w: 0), forKey: "inputGVector")
+                f?.setValue(CIVector(x: -0.02, y: 0.00, z:  0.950, w: 0), forKey: "inputBVector")
+                f?.setValue(CIVector(x:  0.00, y: 0.00, z:  0.000, w: 1), forKey: "inputAVector")
+                f?.setValue(CIVector(x: 0.004, y: 0.002, z: 0.000, w: 0), forKey: "inputBiasVector")
                 self.cachedMatrixFilter = f
             }
             if self.cachedSatFilter == nil {
                 let f = CIFilter(name: "CIColorControls")
-                f?.setValue(0.84, forKey: kCIInputSaturationKey)
+                f?.setValue(0.88, forKey: kCIInputSaturationKey)
                 f?.setValue(0.0,  forKey: kCIInputBrightnessKey)
                 f?.setValue(1.0,  forKey: kCIInputContrastKey)
                 self.cachedSatFilter = f
@@ -200,7 +310,16 @@ final class RYPreviewUIView: UIView {
     private func disableRYMode() {
         // Remove the data output via sessionQueue (thread-safe).
         if let output = videoDataOutput {
-            cameraManager?.removeVideoDataOutput(output)
+            let previewAngle = lastLandscapeAngle   // capture before the async commit
+            cameraManager?.removeVideoDataOutput(output) { [weak self] in
+                // session.commitConfiguration() resets previewLayer.connection.videoRotationAngle.
+                // Re-apply the correct angle so the viewfinder doesn't rotate when
+                // switching back from RY to RAW mode.
+                guard let self = self,
+                      let conn = self.previewLayer.connection,
+                      conn.isVideoRotationAngleSupported(previewAngle) else { return }
+                conn.videoRotationAngle = previewAngle
+            }
             videoDataOutput = nil
         }
 
@@ -259,8 +378,10 @@ final class RYPreviewUIView: UIView {
         }
 
         // AVCaptureVideoPreviewLayer does NOT auto-rotate — must be set explicitly.
-        // Use 0° in landscape (sensor delivers landscape pixels natively) and 90° in portrait.
-        let angle: CGFloat = isLandscape ? 0 : 90
+        // Use lastLandscapeAngle (the angle last applied by setLandscape) so that
+        // layoutSubviews re-applies the correct angle rather than reading a potentially
+        // stale value from the connection (which commitConfiguration can reset to 0°).
+        let angle = lastLandscapeAngle
         if let conn = previewLayer.connection,
            conn.isVideoRotationAngleSupported(angle) {
             conn.videoRotationAngle = angle
@@ -273,6 +394,17 @@ final class RYPreviewUIView: UIView {
 
     func setFormat(_ format: AspectFormat, animated: Bool) {
         guard bounds.width > 0, bounds.height > 0 else { return }
+        // Guard: skip if format AND bounds size are unchanged AND masks already exist.
+        // Without this, updateUIView's direct setFormat call fires 60+ times during
+        // the 0.6 s shutter animation, thrashing Core Animation with begin/commit cycles
+        // and contributing to memory pressure that triggers err=-17281.
+        let sz = bounds.size
+        if format == lastMaskFormat, sz == lastMaskBoundsSize, !maskLayers.isEmpty {
+            currentFormat = format
+            return
+        }
+        lastMaskFormat = format
+        lastMaskBoundsSize = sz
         currentFormat = format
 
         maskLayers.forEach { $0.removeFromSuperlayer() }
@@ -292,8 +424,17 @@ final class RYPreviewUIView: UIView {
             visibleRect = CGRect(x: (w - side) / 2, y: (h - side) / 2,
                                  width: side, height: side)
         case .threeToFour:
-            // Portrait 3:4 / landscape 4:3 — both are the sensor's native aspect, full frame.
-            visibleRect = bounds
+            if isLandscapeBounds {
+                // Landscape 4:3: sensor native aspect is 4:3 but the viewfinder is typically
+                // wider (e.g. 1.54:1).  Mask left/right so only the 4:3 sensor window is
+                // visible — consistent with how other camera apps show the native crop.
+                let targetW = min(w, h * (4.0 / 3.0))
+                visibleRect = CGRect(x: (w - targetW) / 2, y: 0,
+                                     width: targetW, height: h)
+            } else {
+                // Portrait 3:4 is the sensor native — no masking needed.
+                visibleRect = bounds
+            }
         case .twoToThree:
             if isLandscapeBounds {
                 // Landscape: sensor 4:3, target 3:2 → crop top/bottom by factor (2/3)/(3/4) = 8/9
@@ -370,23 +511,27 @@ extension RYPreviewUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
         let texH = drawable.texture.height
         guard texW > 0, texH > 0 else { return }
 
-        // The sensor always delivers landscape pixels (width > height).
-        // In portrait mode we rotate to portrait; in landscape mode we keep the native
-        // landscape orientation so the Metal layer fills the landscape viewfinder correctly.
+        // The videoDataOutput connection's videoRotationAngle is managed by setLandscape():
+        //   portrait  → 90° → connection delivers portrait pixels  (width ≤ height)
+        //   landscape →  0° → connection delivers landscape pixels (width > height)
+        //
+        // Using the pixel-buffer dimensions (not the main-thread `isLandscape` flag)
+        // eliminates the data-race between this videoQueue callback and the main thread.
+        //
+        // For portrait buffers: CIImage fills the portrait Metal layer directly.
+        // For landscape buffers: the aspect-fill scale step (max(scaleX, scaleY)) crops
+        //   the sides to fill the portrait Metal layer, showing the landscape scene perspective.
         let raw = CIImage(cvPixelBuffer: pixelBuffer)
         let ciImage: CIImage
-        if isLandscape {
-            // Phone held landscape — keep native landscape pixels.
+        if raw.extent.width > raw.extent.height {
+            // Landscape pixel buffer (device landscape, connection angle=0°).
+            // Keep as-is; the aspect-fill render step handles the portrait crop.
             ciImage = raw
         } else {
-            // Phone held portrait — conn.videoRotationAngle = 90 may only tag metadata
-            // on some devices/iOS builds without physically rotating the buffer; detect
-            // and correct here to guarantee portrait output.
-            ciImage = raw.extent.width > raw.extent.height
-                ? raw.oriented(.right)  // rotate 90° CW: landscape → portrait
-                : raw                   // connection already delivered portrait
+            // Portrait pixel buffer (device portrait OR connection already rotated to 90°).
+            ciImage = raw
         }
-        let filtered  = applyRYCurve(to: ciImage)
+        let filtered  = applyVGCurve(to: ciImage)
 
         // Scale to aspect-fill the Metal drawable using CILanczosScaleTransform.
         // Previous approach: CGAffineTransform — bilinear nearest-pixel mapping that
@@ -430,49 +575,50 @@ extension RYPreviewUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
         drawable.present()
     }
 
-    /// RY warm-film colour grade for the real-time Metal preview.
+    /// VG (Vintage Gold) colour grade for the real-time Metal preview.
     ///
-    /// Two-stage pipeline (CIToneCurve and CIBloom intentionally excluded):
-    ///   1. CIColorMatrix   — calibrated cross-channel warm tilt (amber/golden quality)
-    ///   2. CIColorControls — mild desaturation (0.84), no contrast boost
+    /// Two-stage pipeline (CIToneCurve, CIColorPolynomial, and CIBloom intentionally excluded):
+    ///   1. CIColorMatrix   — lightweight VG warm hint (lighter than old RY matrix)
+    ///   2. CIColorControls — moderate saturation (0.88), no contrast boost
     ///
-    /// CIBloom was removed from the preview path because at radius=8 it applies a
-    /// full-frame Gaussian blur to every 30fps frame, making the Metal preview visibly
-    /// softer than the hardware AVCaptureVideoPreviewLayer (text becomes unreadable).
-    /// Bloom is still applied in ColorProcessor for saved stills, where the larger
-    /// radius/intensity produces the intended film-frame border effect.
+    /// Why a matrix and not CIColorPolynomial here:
+    ///   The full VG pipeline uses CIColorPolynomial for luminance-separated toning (shadows
+    ///   cool, highlights gold).  On the 30fps Metal preview path, CIColorPolynomial is fast
+    ///   enough per-frame, BUT the extended-linear working space of this CIContext already
+    ///   provides smoother gradients and the global warm hint is sufficient for a live preview
+    ///   — the subtle shadow-blue / highlight-gold distinction is a still-photo refinement
+    ///   that doesn't read clearly on a small moving viewfinder at 30fps.
     ///
-    /// CIToneCurve is applied in ColorProcessor for still photos but NOT here.
-    /// On the Metal path a piecewise tone curve causes visible posterization / banding
-    /// in smooth gradients — the extended-linear CIContext working space handles that.
+    /// Matrix values — tuned for VG preview aesthetic:
+    ///   R_out = 1.02·R − 0.01·B + 0.004   subtle warm nudge (old RY: 1.05, -0.03)
+    ///   G_out = 0.99·G − 0.005·B + 0.002  near-neutral (old RY: 0.98, -0.03)
+    ///   B_out = 0.95·B − 0.02·R            light B reduction (old RY: 0.90, -0.04)
+    ///
+    /// The lighter matrix preserves green and maintains natural skin tones in the live
+    /// preview — matching the VG philosophy of "colour protection over global warming".
     ///
     /// All CIFilter objects are pre-warmed in enableRYMode() and reused every frame.
     /// videoQueue is serial, so all access is data-race-free.
-    ///
-    /// Matrix — conservative warm baseline; scene fine-tuning is handled per-photo
-    /// in ColorProcessor.applyAdaptiveCorrection (green / warm-scene / overcast paths).
-    /// Kept in sync with ColorProcessor.applyExperimentalCurve():
-    ///   R_out = 1.05·R − 0.03·B + 0.006   moderate warm boost
-    ///   G_out = 0.98·G − 0.03·B + 0.003   near-neutral G; B cross-pull keeps sky blue
-    ///   B_out = 0.90·B − 0.04·R            modest B reduction; greens stay green
-    private func applyRYCurve(to image: CIImage) -> CIImage {
+    private func applyVGCurve(to image: CIImage) -> CIImage {
 
-        // ── 1. Warming colour matrix ─────────────────────────────────────────
+        // ── 1. VG warm hint matrix ───────────────────────────────────────────
         if cachedMatrixFilter == nil {
             let f = CIFilter(name: "CIColorMatrix")
-            f?.setValue(CIVector(x:  1.05, y: 0.00, z: -0.03, w: 0), forKey: "inputRVector")
-            f?.setValue(CIVector(x:  0.00, y: 0.98, z: -0.03, w: 0), forKey: "inputGVector")
-            f?.setValue(CIVector(x: -0.04, y: 0.00, z:  0.90, w: 0), forKey: "inputBVector")
-            f?.setValue(CIVector(x:  0.00, y: 0.00, z:  0.00, w: 1), forKey: "inputAVector")
-            f?.setValue(CIVector(x: 0.006, y: 0.003, z: 0.000, w: 0), forKey: "inputBiasVector")
+            f?.setValue(CIVector(x:  1.02, y: 0.00, z: -0.010, w: 0), forKey: "inputRVector")
+            f?.setValue(CIVector(x:  0.00, y: 0.99, z: -0.005, w: 0), forKey: "inputGVector")
+            f?.setValue(CIVector(x: -0.02, y: 0.00, z:  0.950, w: 0), forKey: "inputBVector")
+            f?.setValue(CIVector(x:  0.00, y: 0.00, z:  0.000, w: 1), forKey: "inputAVector")
+            f?.setValue(CIVector(x: 0.004, y: 0.002, z: 0.000, w: 0), forKey: "inputBiasVector")
             cachedMatrixFilter = f
         }
 
-        // ── 2. Mild desaturation — no contrast boost ─────────────────────────
-        // Saturation 0.84 tames oversaturated yellows without dulling the look.
+        // ── 2. Moderate saturation — no contrast boost ───────────────────────
+        // 0.88 (vs old RY 0.84): slightly higher because VG's lighter matrix means
+        // colours haven't been over-shifted, so less desaturation is needed to
+        // tame oversaturation — the result reads more natural in the live viewfinder.
         if cachedSatFilter == nil {
             let f = CIFilter(name: "CIColorControls")
-            f?.setValue(0.84, forKey: kCIInputSaturationKey)
+            f?.setValue(0.88, forKey: kCIInputSaturationKey)
             f?.setValue(0.0,  forKey: kCIInputBrightnessKey)
             f?.setValue(1.0,  forKey: kCIInputContrastKey)
             cachedSatFilter = f

@@ -162,11 +162,18 @@ final class CameraManager: NSObject, ObservableObject {
     // PreviewView MUST use these methods instead of touching session directly on the
     // main thread, which races with sessionQueue and causes err=-17281 / session corruption.
 
-    /// Adds `output` to the session, wires `delegate` / `queue`, and sets portrait
-    /// orientation — all serialised on sessionQueue.
+    /// Adds `output` to the session, wires `delegate` / `queue`, and sets the
+    /// correct orientation — all serialised on sessionQueue.
+    ///
+    /// `initialDataAngle` should be:
+    ///   90° for portrait (default) — connection delivers portrait-rotated pixels.
+    ///   0°  for landscape          — connection delivers native sensor landscape pixels
+    ///                                so the Metal RY path can show the landscape perspective.
     func addVideoDataOutput(_ output: AVCaptureVideoDataOutput,
                              delegate: AVCaptureVideoDataOutputSampleBufferDelegate,
-                             queue: DispatchQueue) {
+                             queue: DispatchQueue,
+                             initialDataAngle: CGFloat = 90,
+                             onCommit: (() -> Void)? = nil) {
         sessionQueue.async {
             self.session.beginConfiguration()
             if self.session.canAddOutput(output) {
@@ -179,11 +186,10 @@ final class CameraManager: NSObject, ObservableObject {
             // The connection graph is only fully finalised after commit;
             // querying connection(with:) inside begin/commit can return nil
             // (connection not yet created) or have the angle silently reset
-            // by the commit itself — both of which leave the Metal preview in
-            // landscape (raw sensor orientation).
+            // by the commit itself.
             if let conn = output.connection(with: .video),
-               conn.isVideoRotationAngleSupported(90) {
-                conn.videoRotationAngle = 90
+               conn.isVideoRotationAngleSupported(initialDataAngle) {
+                conn.videoRotationAngle = initialDataAngle
             }
             // commitConfiguration also resets the photoOutput connection's angle.
             // Re-apply portrait rotation so RY-mode captures remain portrait.
@@ -191,15 +197,29 @@ final class CameraManager: NSObject, ObservableObject {
                conn.isVideoRotationAngleSupported(90) {
                 conn.videoRotationAngle = 90
             }
+            // Notify caller (main thread) so it can re-apply the preview layer angle,
+            // which commitConfiguration also resets silently.
+            if let cb = onCommit {
+                DispatchQueue.main.async { cb() }
+            }
         }
     }
 
     /// Removes `output` from the session, serialised on sessionQueue.
-    func removeVideoDataOutput(_ output: AVCaptureVideoDataOutput) {
+    func removeVideoDataOutput(_ output: AVCaptureVideoDataOutput,
+                                onCommit: (() -> Void)? = nil) {
         sessionQueue.async {
             self.session.beginConfiguration()
             self.session.removeOutput(output)
             self.session.commitConfiguration()
+            // Re-apply photo output portrait angle after commit resets it.
+            if let conn = self.photoOutput.connection(with: .video),
+               conn.isVideoRotationAngleSupported(90) {
+                conn.videoRotationAngle = 90
+            }
+            if let cb = onCommit {
+                DispatchQueue.main.async { cb() }
+            }
         }
     }
 
@@ -372,7 +392,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
 
         let ciImage   = CIImage(cgImage: cropped)
-        let mode: ColorMode = experimentalColor ? .experimental : .normal
+        let mode: ColorMode = experimentalColor ? .vintageGold : .normal
 
         // ── ISO extraction ────────────────────────────────────────────────────────
         // Read sensor ISO from EXIF — drives adaptive sharpening and denoise below.
@@ -467,18 +487,22 @@ final class CameraManager: NSObject, ObservableObject {
         let isoAtten = Float(max(0.30, 1.0 - max(0.0, Double(isoValue) - 200.0) / 1200.0))
         let sharpenStrength = baseSharpen * isoAtten
 
+        // CIUnsharpMask parameters: inputImage, inputRadius, inputIntensity only.
+        // There is NO inputThreshold key — that key belongs to other filters and throws
+        // NSUnknownKeyException at runtime, crashing the app.  The threshold behaviour
+        // (skip flat/noisy areas) is approximated instead by:
+        //   • keeping inputRadius small (1.5 pt) — limits halo spread on flat regions
+        //   • isoAtten — reduces strength at high ISO so noisy flat areas aren't amplified
         let sharpened: CIImage
         if let usmF = CIFilter(name: "CIUnsharpMask") {
             usmF.setValue(upscaled,        forKey: kCIInputImageKey)
-            usmF.setValue(1.5,             forKey: "inputRadius")      // spatial halo size
+            usmF.setValue(1.5,             forKey: "inputRadius")
             usmF.setValue(sharpenStrength, forKey: "inputIntensity")
-            usmF.setValue(0.012,           forKey: "inputThreshold")   // skip flat/noisy areas
             sharpened = usmF.outputImage ?? upscaled
         } else if let legacyF = CIFilter(name: "CISharpenLuminance") {
-            // Fallback for any OS version that lacks CIUnsharpMask
+            // Fallback: CISharpenLuminance — no threshold but produces reasonable results
             legacyF.setValue(upscaled,        forKey: kCIInputImageKey)
             legacyF.setValue(sharpenStrength, forKey: kCIInputSharpnessKey)
-            legacyF.setValue(0.0,             forKey: "inputRadius")
             sharpened = legacyF.outputImage ?? upscaled
         } else {
             sharpened = upscaled
@@ -508,7 +532,25 @@ final class CameraManager: NSObject, ObservableObject {
             finalImage = sharpened
         }
 
-        guard let outputCG = ciContext.createCGImage(finalImage, from: finalImage.extent) else {
+        // Apply a thin black border (5 pt each side).
+        // CIBloom in ColorProcessor is cropped back to the source extent, removing its
+        // white overflow edge.  This compositing step replaces it with a clean dark frame:
+        //   • 5 pt ≈ half the old bloom radius (10 pt) → "half width"
+        //   • black background → replaces the unintentional white glow
+        // Only applied in RY (experimentalColor) mode — RAW mode has no bloom to begin with.
+        let renderImage: CIImage
+        if experimentalColor {
+            let ext = finalImage.extent.integral
+            let borderPt: CGFloat = 5.0
+            let insetRect = ext.insetBy(dx: borderPt, dy: borderPt)
+            let black = CIImage(color: CIColor.black).cropped(to: CGRect(origin: ext.origin,
+                                                                          size: ext.size))
+            renderImage = finalImage.cropped(to: insetRect).composited(over: black)
+        } else {
+            renderImage = finalImage
+        }
+
+        guard let outputCG = ciContext.createCGImage(renderImage, from: renderImage.extent) else {
             await MainActor.run { captureError = "Failed to render final image" }; return
         }
 
@@ -544,7 +586,7 @@ final class CameraManager: NSObject, ObservableObject {
         // Software / lens identification
         exif[kCGImagePropertyExifLensMake             as String] = "only_snap"
         exif[kCGImagePropertyExifUserComment          as String] =
-            "only_snap | \(focalLength)mm | \(experimentalColor ? "RY" : "raw")"
+            "only_snap | \(focalLength)mm | \(experimentalColor ? "VG" : "raw")"
 
         // Original ISO / shutter / aperture / EV are already present in exif from
         // photo.metadata — we only override our custom fields above.
