@@ -35,23 +35,23 @@ enum Theme {
         static let controlsBottomPad: CGFloat = 48
         static let controlsExtraDown: CGFloat = 20
 
-        // Landscape — right-side controls strip
-        static let lsStripWidth: CGFloat      = 108   // controls strip width
-        static let lsShutterOuter: CGFloat    = 76    // shutter ring diameter
-        static let lsShutterInner: CGFloat    = 60    // shutter fill diameter
-        static let lsBtnSize: CGFloat         = 46    // RY / flash button diameter
-        static let lsVPad: CGFloat            = 14    // top/bottom padding in strip
+        // Reserved layout constants from the original camera UI exploration.
+        static let lsStripWidth: CGFloat      = 108
+        static let lsShutterOuter: CGFloat    = 76
+        static let lsShutterInner: CGFloat    = 60
+        static let lsBtnSize: CGFloat         = 46
+        static let lsVPad: CGFloat            = 14
     }
 }
 
 // MARK: - Aspect Format
-enum AspectFormat: CaseIterable {
+enum AspectFormat: CaseIterable, Sendable {
 
     case square       // 1:1
     case threeToFour  // 3:4
     case twoToThree   // 2:3
 
-    var label: String {
+    nonisolated var label: String {
         switch self {
         case .square:      return "1:1"
         case .threeToFour: return "3:4"
@@ -59,26 +59,26 @@ enum AspectFormat: CaseIterable {
         }
     }
 
-    var heightRatio: CGFloat {
+    nonisolated var heightRatio: CGFloat {
         switch self {
         case .square:      return 1.0
         case .threeToFour: return 4.0 / 3.0
-        case .twoToThree:  return (3.0 / 2.0) * 0.95
+        case .twoToThree:  return 3.0 / 2.0
         }
     }
 
-    func verticalOffset(forWidth w: CGFloat) -> CGFloat {
+    nonisolated func verticalOffset(forWidth w: CGFloat) -> CGFloat {
         let baseH    = w * (4.0 / 3.0)
         let currentH = w * heightRatio
         return (currentH - baseH) / 2.0 * -1.0
     }
 
-    func next() -> AspectFormat {
+    nonisolated func next() -> AspectFormat {
         let all = AspectFormat.allCases
         return all[(all.firstIndex(of: self)! + 1) % all.count]
     }
 
-    func previous() -> AspectFormat {
+    nonisolated func previous() -> AspectFormat {
         let all = AspectFormat.allCases
         return all[(all.firstIndex(of: self)! - 1 + all.count) % all.count]
     }

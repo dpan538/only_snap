@@ -13,9 +13,9 @@ import SwiftUI
 // The only reliable way to lock to portrait programmatically is via
 // UIApplicationDelegate.application(_:supportedInterfaceOrientationsFor:).
 // Device orientation changes are still tracked through UIDevice notifications in
-// ContentView and used solely to rotate individual icons + adjust videoRotationAngle —
-// the layout itself never rotates, keeping AVCaptureVideoPreviewLayer out of any
-// transformed CALayer hierarchy (which would corrupt the XPC link → err=-17281).
+// ContentView and used solely to rotate individual icons + adjust camera connection
+// angles. The layout itself never rotates, which keeps preview rendering out of
+// transformed UIKit/CALayer hierarchies while the camera pipeline stays stable.
 
 class AppDelegate: NSObject, UIApplicationDelegate {
     func application(

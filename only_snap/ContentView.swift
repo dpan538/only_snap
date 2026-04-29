@@ -4,54 +4,35 @@ private typealias L = Theme.Layout
 
 struct ContentView: View {
 
-    // MARK: - Camera
     @EnvironmentObject private var camera: CameraManager
-
-    // MARK: - UI State
-    @State private var selectedFocal: Int           = 35
-    @State private var flashOn: Bool                = false
-    @State private var experimentalColor: Bool      = false
-    @State private var selectedFormat: AspectFormat = .threeToFour
-    @State private var shutterProgress: CGFloat      = 0
-
-    // Device orientation — drives icon rotation and camera videoRotationAngle.
-    // The INTERFACE orientation is always portrait (locked in only_snapApp.swift).
-    // Only icons/text and the camera feed content respond to device orientation;
-    // the layout itself never changes, so AVCaptureVideoPreviewLayer is never
-    // inside a transformed hierarchy (which would break the XPC link → err=-17281).
-    @State private var deviceOrientation: UIDeviceOrientation = UIDevice.current.orientation
+    @State private var shutterProgress: CGFloat = 0
 
     private let focals = [21, 35, 50, 105]
     private let haptic = UIImpactFeedbackGenerator(style: .rigid)
+    private let orientationUIAnimation = Animation.linear(duration: 0.14)
+    private let selectionAnimation = Animation.linear(duration: 0.12)
+    private let aspectAnimation = Animation.linear(duration: 0.16)
 
-    // MARK: - Orientation helpers
-
-    /// Rotation to apply to individual icons/text so they appear upright
-    /// when the device is held in landscape (left only — right is ignored).
     private var iconRotation: Angle {
-        deviceOrientation == .landscapeLeft ? .degrees(90) : .degrees(0)
+        camera.cameraOrientation.isLandscape ? .degrees(90) : .degrees(0)
     }
 
-    /// True when device is held landscape-left.
-    private var isDeviceLandscape: Bool {
-        deviceOrientation == .landscapeLeft
+    private var filmProfileButtonTitle: String {
+        if let pendingFilmProfile = camera.pendingFilmProfile {
+            return "\(pendingFilmProfile.label)…"
+        }
+        return camera.activeFilmProfile.label
     }
 
-    /// The `videoRotationAngle` for the preview layer when landscape.
-    /// Only landscapeLeft is supported (0°); landscapeRight is filtered out in onReceive.
-    private var landscapeRotationAngle: CGFloat { 0 }
-
-    // MARK: - Body
     var body: some View {
         GeometryReader { screen in
-            let sw   = screen.size.width
-            let sh   = screen.size.height
+            let sw = screen.size.width
+            let sh = screen.size.height
             let safe = screen.safeAreaInsets
 
             ZStack {
                 Theme.Colors.background.ignoresSafeArea()
-                // Always portrait layout — never apply rotationEffect to this VStack.
-                // Device landscape is handled by individual icon rotation + camera angle.
+
                 VStack(spacing: 0) {
                     viewfinderBlock(screenWidth: sw, screenHeight: sh, safeTop: safe.top)
                     Spacer(minLength: 0)
@@ -62,53 +43,51 @@ struct ContentView: View {
         }
         .ignoresSafeArea(edges: .bottom)
         .onAppear {
-            // Must call this before UIDevice.current.orientation reports non-unknown values.
             UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+            camera.updateCameraOrientation(UIDevice.current.orientation)
         }
         .onDisappear {
             UIDevice.current.endGeneratingDeviceOrientationNotifications()
             camera.stop()
         }
-        .onReceive(NotificationCenter.default.publisher(
-            for: UIDevice.orientationDidChangeNotification)) { _ in
-            let o = UIDevice.current.orientation
-            // Only respond to portrait and landscape-left.
-            // landscapeRight is ignored: the development device only rotates left,
-            // and supporting both directions doubles the angle-correction complexity
-            // while landscapeRight (previewAngle=180°) is rarely needed in practice.
-            // portraitUpsideDown is also ignored (uncommon, no icon-rotation value).
-            guard o == .portrait || o == .landscapeLeft else { return }
-            withAnimation(.easeInOut(duration: 0.25)) {
-                deviceOrientation = o
-            }
+        .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
+            camera.updateCameraOrientation(UIDevice.current.orientation)
+        }
+        .alert("Camera Error", isPresented: captureErrorBinding) {
+            Button("OK") { camera.captureError = nil }
+        } message: {
+            Text(camera.captureError ?? "Unknown camera error")
         }
     }
 
-    // MARK: - Viewfinder
+    private var captureErrorBinding: Binding<Bool> {
+        Binding(
+            get: { camera.captureError != nil },
+            set: { if !$0 { camera.captureError = nil } }
+        )
+    }
+
     private func viewfinderBlock(
         screenWidth sw: CGFloat,
         screenHeight sh: CGFloat,
         safeTop: CGFloat
     ) -> some View {
-        // Clamp to 1 pt minimum — GeometryReader can deliver zero on its very first
-        // layout pass (before the window has real dimensions).  A negative or zero vfWidth
-        // produces negative frame values that trigger SwiftUI's "Invalid frame dimension"
-        // runtime warning and propagate a non-positive bounds to PreviewView's UIView.
-        let vfWidth    = max(1, sw - L.vfHPad * 2)
-        let maxH       = vfWidth * AspectFormat.twoToThree.heightRatio
+        let selectedFormat = camera.selectedAspectFormat
+        let vfWidth = max(1, sw - L.vfHPad * 2)
+        let maxH = vfWidth * AspectFormat.twoToThree.heightRatio
         let containerH = maxH + L.vfTopOffset + 20
-        let vfHeight   = max(1, vfWidth * selectedFormat.heightRatio)
+        let vfHeight = max(1, vfWidth * selectedFormat.heightRatio)
 
-        let twoRowsH: CGFloat  = L.btnSize * 2 + 18
+        let twoRowsH: CGFloat = L.btnSize * 2 + 18
         let focalRowH: CGFloat = 44
         let controlsH: CGFloat = (L.controlsBottomPad + L.controlsExtraDown)
-                                  + twoRowsH + L.focalToButtons + focalRowH
-        let focalRowTop        = sh - controlsH + 35
-        let islandBottom       = safeTop
-        let availableH         = focalRowTop - islandBottom
-        let squareCentreY      = islandBottom + availableH / 2
+            + twoRowsH + L.focalToButtons + focalRowH
+        let focalRowTop = sh - controlsH + 35
+        let islandBottom = safeTop
+        let availableH = focalRowTop - islandBottom
+        let squareCentreY = islandBottom + availableH / 2
         let containerTopInScreen = islandBottom - 35
-        let squareOffsetY      = squareCentreY - (containerTopInScreen + containerH / 2)
+        let squareOffsetY = squareCentreY - (containerTopInScreen + containerH / 2)
 
         let vOffset: CGFloat = {
             switch selectedFormat {
@@ -118,30 +97,31 @@ struct ContentView: View {
         }()
 
         return ZStack {
-            // Outer border
             RoundedRectangle(cornerRadius: 14)
                 .strokeBorder(Theme.Colors.bodyDark, lineWidth: 1.5)
                 .frame(width: vfWidth, height: vfHeight)
 
-            // Live preview + fallback background.
-            // Black fill: the camera sensor is surrounded by black when letterboxed;
-            // using black here also hides any sub-pixel gap at the viewfinder edges
-            // that can appear due to fractional-point frame rounding on retina screens.
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.black)
                 .frame(width: max(1, vfWidth - 12), height: max(1, vfHeight - 12))
                 .overlay(
-                    PreviewView(session: camera.session,
-                                format: selectedFormat,
-                                isSessionRunning: camera.isSessionRunning,
-                                ryEnabled: experimentalColor,
-                                isLandscape: isDeviceLandscape,
-                                landscapeRotationAngle: landscapeRotationAngle,
-                                cameraManager: camera)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    PreviewView(
+                        format: selectedFormat,
+                        activeFilmProfile: camera.activeFilmProfile,
+                        pendingFilmProfile: camera.pendingFilmProfile,
+                        focalLength: camera.selectedFocalLength,
+                        orientation: camera.cameraOrientation,
+                        previewGeneration: camera.previewGeneration,
+                        isPreviewTransitioning: camera.isPreviewTransitioning,
+                        previewTransitionReason: camera.previewTransitionReason,
+                        cameraManager: camera
+                    )
+                    .transaction { transaction in
+                        transaction.animation = nil
+                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
                 )
                 .overlay(
-                    // Corner guides and crosshair sit above the preview, non-interactive
                     ZStack {
                         ViewfinderCorners()
                         CrosshairView()
@@ -149,14 +129,13 @@ struct ContentView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .allowsHitTesting(false)
                 )
-                // Permission denied overlay
                 .overlay(
                     Group {
-                        if camera.permissionDenied {
+                        if let permissionMessage = camera.permissionMessage, camera.permissionDenied {
                             RoundedRectangle(cornerRadius: 10)
                                 .fill(Color.black.opacity(0.75))
                                 .overlay(
-                                    Text("Camera access required")
+                                    Text(permissionMessage)
                                         .font(.system(size: 14, weight: .medium))
                                         .foregroundColor(.white)
                                 )
@@ -165,17 +144,16 @@ struct ContentView: View {
                 )
         }
         .offset(y: vOffset)
-        .animation(.spring(response: 0.35, dampingFraction: 0.82), value: selectedFormat)
+        .animation(aspectAnimation, value: selectedFormat)
         .frame(width: sw, height: containerH)
         .padding(.top, L.vfTopOffset)
     }
 
-    // MARK: - Controls
     private var controlsBlock: some View {
         VStack(spacing: 0) {
             focalRow
                 .padding(.bottom, L.focalToButtons + 10)
-                .offset(y: -5)
+                .offset(y: -10)
 
             ZStack(alignment: .center) {
                 shutterButton
@@ -185,87 +163,80 @@ struct ContentView: View {
                     rightButtons
                 }
             }
+            .offset(y: -20)
             .padding(.horizontal, L.vfHPad)
         }
         .padding(.bottom, L.controlsBottomPad + L.controlsExtraDown)
+        .animation(orientationUIAnimation, value: camera.cameraOrientation)
     }
 
-    // MARK: - Focal Row
     private var focalRow: some View {
-        HStack(alignment: .lastTextBaseline, spacing: 22) {
+        HStack(alignment: .lastTextBaseline, spacing: 14) {
             ForEach(focals, id: \.self) { mm in
                 Button { switchFocal(to: mm) } label: {
-                    if mm == selectedFocal {
-                        HStack(alignment: .lastTextBaseline, spacing: 2) {
-                            Text("\(mm)")
-                                .font(.system(size: 36, weight: .medium))
-                                .foregroundColor(Theme.Colors.bodyDark)
-                            Text("mm")
-                                .font(.system(size: 15, weight: .regular))
-                                .foregroundColor(Theme.Colors.textSubtle)
-                        }
-                        .rotationEffect(iconRotation)
-                    } else {
+                    let isSelected = mm == camera.selectedFocalLength
+                    HStack(alignment: .lastTextBaseline, spacing: 2) {
                         Text("\(mm)")
-                            .font(.system(size: 20, weight: .regular))
-                            .foregroundColor(Theme.Colors.textMuted)
-                            .rotationEffect(iconRotation)
+                            .font(.system(size: isSelected ? 36 : 20, weight: isSelected ? .medium : .regular))
+                            .foregroundColor(isSelected ? Theme.Colors.bodyDark : Theme.Colors.textMuted)
+                        Text("mm")
+                            .font(.system(size: 15, weight: .regular))
+                            .foregroundColor(Theme.Colors.textSubtle)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .frame(width: isSelected ? 30 : 0, alignment: .leading)
+                            .clipped()
+                            .opacity(isSelected ? 1 : 0)
                     }
+                    .scaleEffect(isSelected ? 1.0 : 0.985)
+                    .opacity(isSelected ? 1.0 : 0.95)
+                    .rotationEffect(iconRotation)
                 }
                 .buttonStyle(.plain)
             }
         }
+        .animation(selectionAnimation, value: camera.selectedFocalLength)
         .gesture(focalSwipeGesture)
     }
 
-    // MARK: - Left Buttons
     private var leftButtons: some View {
         VStack(spacing: 18) {
-
-            // Flash
             Button {
-                flashOn.toggle()
-                camera.setFlash(flashOn)
+                let next = !camera.flashEnabled
+                camera.setFlashEnabled(next)
             } label: {
                 Circle()
                     .fill(Theme.Colors.buttonFill)
                     .frame(width: L.btnSize, height: L.btnSize)
                     .overlay(Circle().strokeBorder(Theme.Colors.buttonBorder, lineWidth: 1))
                     .overlay(
-                        Image(systemName: flashOn ? "bolt.fill" : "bolt.slash.fill")
+                        Image(systemName: camera.flashEnabled ? "bolt.fill" : "bolt.slash.fill")
                             .font(.system(size: 26, weight: .medium))
-                            .foregroundColor(flashOn ? Theme.Colors.bodyDark : Theme.Colors.textMuted)
+                            .foregroundColor(camera.flashEnabled ? Theme.Colors.bodyDark : Theme.Colors.textMuted)
                             .rotationEffect(iconRotation)
                     )
             }
             .buttonStyle(.plain)
 
-            // Experimental color
             Button {
-                withAnimation(.easeInOut(duration: 0.18)) { experimentalColor.toggle() }
+                toggleFilmProfile()
             } label: {
-                expColorButton
+                filmProfileButton
             }
             .buttonStyle(.plain)
         }
         .offset(y: -15)
+        .animation(selectionAnimation, value: camera.flashEnabled)
+        .animation(selectionAnimation, value: camera.activeFilmProfile)
+        .animation(selectionAnimation, value: camera.pendingFilmProfile)
     }
 
-    @ViewBuilder
-    private var expColorButton: some View {
-        if experimentalColor {
-            Circle()
-                .fill(Theme.Colors.cream)
-                .frame(width: L.btnSize, height: L.btnSize)
-                .overlay(Circle().strokeBorder(Theme.Colors.bodyDark, lineWidth: 2))
-                .overlay(
-                    Text("VG")
-                        .font(.system(size: 21, weight: .medium))
-                        .foregroundColor(Theme.Colors.bodyDark)
-                        .kerning(0.5)
-                        .rotationEffect(iconRotation)
-                )
-        } else {
+    private var filmProfileButton: some View {
+        let displayedProfile = camera.pendingFilmProfile ?? camera.activeFilmProfile
+        let showsProcessedProfile = displayedProfile != .raw
+        let isPendingProcessedProfile = camera.pendingFilmProfile != nil && showsProcessedProfile
+
+        return ZStack {
             Circle()
                 .fill(Theme.Colors.rawFill)
                 .frame(width: L.btnSize, height: L.btnSize)
@@ -276,44 +247,54 @@ struct ContentView: View {
                         .kerning(1.0)
                         .rotationEffect(iconRotation)
                 )
+                .opacity(showsProcessedProfile ? 0 : 1)
+
+            Circle()
+                .fill(Theme.Colors.cream.opacity(isPendingProcessedProfile ? 0.65 : 1.0))
+                .frame(width: L.btnSize, height: L.btnSize)
+                .overlay(Circle().strokeBorder(Theme.Colors.bodyDark, lineWidth: 2))
+                .overlay(
+                    Text(filmProfileButtonTitle)
+                        .font(.system(size: isPendingProcessedProfile ? 18 : 21, weight: .medium))
+                        .foregroundColor(Theme.Colors.bodyDark)
+                        .kerning(0.5)
+                        .rotationEffect(iconRotation)
+                )
+                .opacity(showsProcessedProfile ? 1 : 0)
         }
+        .animation(selectionAnimation, value: camera.activeFilmProfile)
+        .animation(selectionAnimation, value: camera.pendingFilmProfile)
     }
 
-    // MARK: - Shutter
     private var shutterButton: some View {
         Button {
             guard camera.isSessionRunning else { return }
-            // Reset and trigger arc animation
             shutterProgress = 0
             withAnimation(.linear(duration: 0.6)) {
                 shutterProgress = 1
             }
             Task {
-                await camera.capture(
-                    format: selectedFormat,
-                    experimentalColor: experimentalColor
-                )
+                await camera.capture()
             }
         } label: {
             ZStack {
-                // Invisible tap-target — preserves original hit area
                 Circle()
                     .fill(Color.clear)
                     .frame(width: L.shutterOuter, height: L.shutterOuter)
 
-                // Static outer ring (−10% visual)
                 Circle()
                     .strokeBorder(Theme.Colors.bodyDark.opacity(0.25), lineWidth: 2.5)
                     .frame(width: L.shutterOuter * 0.9, height: L.shutterOuter * 0.9)
 
-                // Animated arc (−10% visual)
                 Circle()
                     .trim(from: 0, to: shutterProgress)
-                    .stroke(Theme.Colors.bodyDark, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .stroke(
+                        Theme.Colors.bodyDark,
+                        style: StrokeStyle(lineWidth: 2.5, lineCap: .round)
+                    )
                     .frame(width: L.shutterOuter * 0.9, height: L.shutterOuter * 0.9)
                     .rotationEffect(.degrees(-90))
 
-                // Inner filled circle (−10% visual)
                 Circle()
                     .fill(Theme.Colors.bodyDark)
                     .frame(width: L.shutterInner * 0.9, height: L.shutterInner * 0.9)
@@ -323,13 +304,14 @@ struct ContentView: View {
         .offset(y: -15)
     }
 
-    // MARK: - Right Buttons
     private var rightButtons: some View {
         VStack(spacing: 18) {
             Color.clear.frame(width: L.btnSize, height: L.btnSize)
 
-            Button { switchFormat(to: selectedFormat.next()) } label: {
-                Text(selectedFormat.label)
+            Button {
+                switchFormat(to: camera.selectedAspectFormat.next())
+            } label: {
+                Text(camera.selectedAspectFormat.label)
                     .font(.system(size: 20, weight: .medium))
                     .foregroundColor(Theme.Colors.bodyDark)
                     .padding(.horizontal, 16)
@@ -338,63 +320,75 @@ struct ContentView: View {
                         RoundedRectangle(cornerRadius: 6)
                             .strokeBorder(Theme.Colors.bodyDark, lineWidth: 1.5)
                     )
-                    // rotationEffect AFTER overlay so the border rotates with the text
                     .rotationEffect(iconRotation)
             }
             .buttonStyle(.plain)
             .offset(y: -L.formatUpLift)
             .gesture(formatSwipeGesture)
         }
+        .animation(aspectAnimation, value: camera.selectedAspectFormat)
     }
 
-    // MARK: - Gestures (Portrait)
     private var focalSwipeGesture: some Gesture {
         DragGesture(minimumDistance: 10)
             .onChanged { value in
                 let steps = Int((-value.translation.width) / L.swipeThreshold)
                 guard steps != 0 else { return }
-                let idx    = focals.firstIndex(of: selectedFocal) ?? 1
+                let idx = focals.firstIndex(of: camera.selectedFocalLength) ?? 1
                 let newIdx = (idx + steps).clamped(to: 0...(focals.count - 1))
-                if focals[newIdx] != selectedFocal { switchFocal(to: focals[newIdx]) }
+                if focals[newIdx] != camera.selectedFocalLength {
+                    switchFocal(to: focals[newIdx])
+                }
             }
     }
 
     private var formatSwipeGesture: some Gesture {
         DragGesture(minimumDistance: 10)
             .onChanged { value in
-                let dx       = value.translation.width
-                let dy       = value.translation.height
+                let dx = value.translation.width
+                let dy = value.translation.height
                 let dominant = abs(dx) > abs(dy) ? dx : -dy
-                let steps    = Int(dominant / L.swipeThreshold)
+                let steps = Int(dominant / L.swipeThreshold)
                 guard steps != 0 else { return }
-                let all    = AspectFormat.allCases
-                let idx    = all.firstIndex(of: selectedFormat)!
+                let all = AspectFormat.allCases
+                let idx = all.firstIndex(of: camera.selectedAspectFormat) ?? 0
                 let newIdx = (idx + steps).clamped(to: 0...(all.count - 1))
-                if all[newIdx] != selectedFormat { switchFormat(to: all[newIdx]) }
+                if all[newIdx] != camera.selectedAspectFormat {
+                    switchFormat(to: all[newIdx])
+                }
             }
     }
 
-    // MARK: - Helpers
     private func switchFocal(to mm: Int) {
-        guard mm != selectedFocal else { return }
         haptic.impactOccurred()
-        withAnimation(.easeInOut(duration: 0.12)) { selectedFocal = mm }
         camera.setFocalLength(mm)
     }
 
     private func switchFormat(to format: AspectFormat) {
-        guard format != selectedFormat else { return }
+        guard format != camera.selectedAspectFormat else { return }
         haptic.impactOccurred()
-        selectedFormat = format
+        camera.setAspectFormat(format)
+    }
+
+    private func toggleFilmProfile() {
+        haptic.impactOccurred()
+        let displayedProfile = camera.pendingFilmProfile ?? camera.activeFilmProfile
+        switch displayedProfile {
+        case .raw:
+            camera.requestFilmProfile(.vg)
+        case .vg:
+            camera.requestFilmProfile(.ew)
+        case .ew:
+            camera.requestFilmProfile(.raw)
+        }
     }
 }
 
-// MARK: - Viewfinder Corners
 struct ViewfinderCorners: View {
-    let size: CGFloat      = 18
+    let size: CGFloat = 18
     let lineWidth: CGFloat = 1.5
-    let color              = Color.white.opacity(0.35)
-    let inset: CGFloat     = 12
+    let color = Color.white.opacity(0.35)
+    let inset: CGFloat = 12
 
     var body: some View {
         GeometryReader { geo in
@@ -426,11 +420,11 @@ struct ViewfinderCorners: View {
     }
 }
 
-// MARK: - Crosshair
 struct CrosshairView: View {
-    let size: CGFloat      = 26
+    let size: CGFloat = 26
     let lineWidth: CGFloat = 1.5
-    let color              = Color.white.opacity(0.38)
+    let color = Color.white.opacity(0.38)
+
     var body: some View {
         ZStack {
             Rectangle().fill(color).frame(width: size, height: lineWidth)
@@ -439,15 +433,8 @@ struct CrosshairView: View {
     }
 }
 
-// MARK: - Clamping
 extension Comparable {
     func clamped(to range: ClosedRange<Self>) -> Self {
         min(max(self, range.lowerBound), range.upperBound)
     }
-}
-
-#Preview {
-    ContentView()
-        .environmentObject(CameraManager())
-        .preferredColorScheme(.light)
 }
