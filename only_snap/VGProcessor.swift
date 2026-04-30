@@ -58,13 +58,27 @@ enum VGProcessor {
                 && highlightRatio > 0.34
                 && !isNight
         }
+        nonisolated var isNeutralWhiteDominant: Bool {
+            let topMax = max(topR, topG, topB)
+            let topMin = min(topR, topG, topB)
+            let topSat = topMax > 0.01 ? (topMax - topMin) / topMax : 0.0
+            return satScore < 0.16
+                && topSat < 0.16
+                && luminance > 0.50
+                && highlightRatio > 0.54
+                && !isNight
+        }
         nonisolated var isSunlit: Bool {
-            highlightRatio > 0.48 && luminance > 0.28 && !isNight
+            highlightRatio > 0.48 && luminance > 0.28 && !isNight && !isNeutralWhiteDominant
         }
     }
 
     nonisolated static func preheatResources() {
         _ = vgAtmosphereLUT()
+        let sample = CIImage(color: CIColor(red: 0.66, green: 0.62, blue: 0.52))
+            .cropped(to: CGRect(x: 0, y: 0, width: 64, height: 64))
+        renderWarmup(apply(to: sample, focalLength: 35))
+        renderWarmup(apply(to: sample, focalLength: 105))
     }
 
     nonisolated static func apply(to image: CIImage, focalLength: Int) -> CIImage {
@@ -205,8 +219,8 @@ enum VGProcessor {
             if scene.isSunset { return 1.20 }
             let rise = smoothstep(lo: 3200, hi: 5000, t: scene.kelvin)
             let fall = 1.0 - smoothstep(lo: 6000, hi: 8000, t: scene.kelvin)
-            let sunlightFloor: CGFloat = scene.isSunlit ? 0.76 : 0.0
-            return max(rise * fall, sunlightFloor).clamped(to: 0.34...1.18)
+            let sunlightFloor: CGFloat = scene.isSunlit ? 0.58 : 0.0
+            return max(rise * fall, sunlightFloor).clamped(to: 0.24...0.95)
         }()
         let vgToneOut = applyVGToneCurve(to: baseImage, strength: toneStrength)
 
@@ -231,13 +245,15 @@ enum VGProcessor {
             lutOut = toneOut
         }
 
-        let targetSat = (0.86 + (1.0 - scene.satScore) * 0.14)
-            .clamped(to: 0.78...1.08)
+        let targetSat = (0.84 + (1.0 - scene.satScore) * 0.10)
+            .clamped(to: 0.76...1.02)
         let finalSat: CGFloat
         if scene.isNight {
             finalSat = min(targetSat, 0.86)
         } else if scene.isSunset {
-            finalSat = min(targetSat + 0.03, 1.09)
+            finalSat = min(targetSat + 0.02, 1.04)
+        } else if scene.isBlueSkyDominant || scene.isNeutralWhiteDominant {
+            finalSat = min(targetSat, 0.94)
         } else {
             finalSat = targetSat
         }
@@ -275,13 +291,13 @@ enum VGProcessor {
         guard let poly = CIFilter(name: "CIColorPolynomial") else { return image }
         let s = strength
 
-        let sR: CGFloat = 0.004 * s
+        let sR: CGFloat = 0.002 * s
         let sG: CGFloat = 0.000 * s
-        let sB: CGFloat = -0.010 * s
+        let sB: CGFloat = -0.004 * s
 
-        let hR: CGFloat = 0.028 * s
-        let hG: CGFloat = 0.014 * s
-        let hB: CGFloat = -0.026 * s
+        let hR: CGFloat = 0.014 * s
+        let hG: CGFloat = 0.004 * s
+        let hB: CGFloat = -0.012 * s
 
         poly.setValue(image, forKey: kCIInputImageKey)
         poly.setValue(CIVector(x: sR, y: 1.0, z: 0.0, w: hR - sR), forKey: "inputRedCoefficients")
@@ -420,20 +436,23 @@ enum VGProcessor {
     nonisolated private static func applyGold200FinalBalance(to image: CIImage, scene: SceneAnalysis) -> CIImage {
         guard !scene.isNight, let mat = CIFilter(name: "CIColorMatrix") else { return image }
 
-        let sunlight = scene.isSunlit ? 1.0 : 0.45
+        let sunlight = scene.isSunlit ? 0.62 : 0.16
         let blueContainment = scene.isBlueSkyDominant ? 1.0 : max(0.0, min(1.0, (scene.avgB - scene.avgR - 0.04) / 0.18))
-        let goldStrength = (sunlight * (1.0 - blueContainment * 0.20)).clamped(to: 0.0...1.0)
+        let neutralWhiteProtection: CGFloat = scene.isNeutralWhiteDominant ? 0.20 : 1.0
+        let goldStrength = (sunlight * (1.0 - blueContainment * 0.28) * neutralWhiteProtection)
+            .clamped(to: 0.0...0.72)
+        let whiteBiasProtection: CGFloat = scene.isNeutralWhiteDominant ? 0.0 : 1.0
 
         mat.setValue(image, forKey: kCIInputImageKey)
-        mat.setValue(CIVector(x: 1.0 + 0.010 * goldStrength, y: 0, z: 0, w: 0), forKey: "inputRVector")
-        mat.setValue(CIVector(x: 0, y: 1.0 + 0.004 * goldStrength, z: 0, w: 0), forKey: "inputGVector")
-        mat.setValue(CIVector(x: 0, y: 0, z: 1.0 - 0.018 * goldStrength - 0.035 * blueContainment, w: 0), forKey: "inputBVector")
+        mat.setValue(CIVector(x: 1.0 + 0.004 * goldStrength, y: 0, z: 0, w: 0), forKey: "inputRVector")
+        mat.setValue(CIVector(x: 0, y: 1.0 + 0.001 * goldStrength, z: 0, w: 0), forKey: "inputGVector")
+        mat.setValue(CIVector(x: 0, y: 0, z: 1.0 - 0.008 * goldStrength - 0.018 * blueContainment, w: 0), forKey: "inputBVector")
         mat.setValue(CIVector(x: 0, y: 0, z: 0, w: 1), forKey: "inputAVector")
         mat.setValue(
             CIVector(
-                x: 0.004 * goldStrength,
-                y: 0.002 * goldStrength,
-                z: -0.004 * goldStrength - 0.005 * blueContainment,
+                x: 0.0015 * goldStrength * whiteBiasProtection,
+                y: 0.0005 * goldStrength * whiteBiasProtection,
+                z: -0.0015 * goldStrength - 0.003 * blueContainment,
                 w: 0
             ),
             forKey: "inputBiasVector"
@@ -446,18 +465,18 @@ enum VGProcessor {
     nonisolated private static func applyOvercastEnhancement(to image: CIImage, luminance: CGFloat) -> CIImage {
         guard let satFilter = CIFilter(name: "CIColorControls") else { return image }
         satFilter.setValue(image, forKey: kCIInputImageKey)
-        satFilter.setValue(1.12, forKey: kCIInputSaturationKey)
+        satFilter.setValue(1.02, forKey: kCIInputSaturationKey)
         satFilter.setValue(0.0, forKey: kCIInputBrightnessKey)
-        satFilter.setValue(1.04, forKey: kCIInputContrastKey)
+        satFilter.setValue(1.015, forKey: kCIInputContrastKey)
         guard let satOut = satFilter.outputImage else { return image }
 
         guard let depthFilter = CIFilter(name: "CIColorMatrix") else { return satOut }
         depthFilter.setValue(satOut, forKey: kCIInputImageKey)
-        depthFilter.setValue(CIVector(x: 1.03, y: 0.00, z: 0.00, w: 0), forKey: "inputRVector")
-        depthFilter.setValue(CIVector(x: 0.00, y: 0.92, z: 0.00, w: 0), forKey: "inputGVector")
-        depthFilter.setValue(CIVector(x: 0.00, y: -0.02, z: 0.88, w: 0), forKey: "inputBVector")
+        depthFilter.setValue(CIVector(x: 1.006, y: 0.00, z: 0.00, w: 0), forKey: "inputRVector")
+        depthFilter.setValue(CIVector(x: 0.00, y: 0.998, z: 0.00, w: 0), forKey: "inputGVector")
+        depthFilter.setValue(CIVector(x: 0.00, y: 0.00, z: 0.990, w: 0), forKey: "inputBVector")
         depthFilter.setValue(CIVector(x: 0.00, y: 0.00, z: 0.00, w: 1), forKey: "inputAVector")
-        depthFilter.setValue(CIVector(x: 0.010, y: -0.005, z: -0.008, w: 0), forKey: "inputBiasVector")
+        depthFilter.setValue(CIVector(x: 0.001, y: 0.000, z: -0.001, w: 0), forKey: "inputBiasVector")
         return depthFilter.outputImage ?? satOut
     }
 
@@ -523,7 +542,7 @@ enum VGProcessor {
                         ? (v < 0.55 ? 0.62 : 0.78)
                         : 1.0
                     let cyanClamp: Float = (h >= 165 && h < 198) ? 0.86 : 1.0
-                    let yellowLift: Float = (h >= 35 && h < 72 && v > 0.45) ? 1.02 : 1.0
+                    let yellowLift: Float = (h >= 35 && h < 72 && s > 0.25 && v > 0.45) ? 1.05 : 1.0
 
                     let newS = min(s * effSM * lowBoost * hiClamp * blueShadowClamp * cyanClamp, 1.0)
                     let newV = min(v * vMult * yellowLift, 1.0)
@@ -546,15 +565,27 @@ enum VGProcessor {
     nonisolated private static func vgHueMap(hue: Float) -> (Float, Float, Float) {
         let h = (hue.truncatingRemainder(dividingBy: 360) + 360)
             .truncatingRemainder(dividingBy: 360)
-        if h < 20 { return (h + 4.0, 1.02, 1.00) }
-        if h < 50 { return (h + 4.0, 1.08, 1.02) }
-        if h < 75 { return (h + 5.0, 1.12, 1.03) }
+        if h < 20 { return (h + 3.0, 1.00, 1.00) }
+        if h < 50 { return (h + 3.0, 1.04, 1.03) }
+        if h < 75 { return (h + 4.0, 1.06, 1.05) }
         if h < 120 { return (h + 0.0, 1.02, 1.00) }
         if h < 165 { return (h + 1.0, 1.02, 0.99) }
-        if h < 200 { return (h - 4.0, 0.92, 1.00) }
-        if h < 255 { return (h + 1.0, 0.80, 0.96) }
+        if h < 200 { return (h + 2.0, 0.88, 1.00) }
+        if h < 255 { return (h + 0.0, 0.76, 0.98) }
         if h < 310 { return (h - 3.0, 0.96, 0.99) }
         return (h + 0.0, 0.95, 1.00)
+    }
+
+    nonisolated private static func renderWarmup(_ image: CIImage) {
+        var px = [UInt8](repeating: 0, count: 4)
+        analysisCIContext.render(
+            image,
+            toBitmap: &px,
+            rowBytes: 4,
+            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            format: .RGBA8,
+            colorSpace: CGColorSpaceCreateDeviceRGB()
+        )
     }
 
     nonisolated private static func hsvToRGBf(h: Float, s: Float, v: Float) -> (Float, Float, Float) {

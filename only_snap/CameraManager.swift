@@ -314,6 +314,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                 )
             } else {
                 pendingFilmProfile = .vg
+                preheatVGResourcesIfNeeded()
                 RuntimeLog.info("[FilmProfile]", "requested=vg active=raw ready=false pending=true")
             }
         case .ew:
@@ -327,6 +328,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                 )
             } else {
                 pendingFilmProfile = .ew
+                preheatEWResourcesIfNeeded()
                 RuntimeLog.info(
                     "[FilmProfile]",
                     "requested=ew active=\(activeFilmProfile.logName) ready=false pending=true"
@@ -413,7 +415,6 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             )
         }
         preheatVGResourcesIfNeeded()
-        preheatEWResourcesIfNeeded()
     }
 
     func notifyPreviewFrameRendered(
@@ -505,8 +506,18 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             do {
                 if selection.device.uniqueID == previousDeviceID {
                     try selection.device.lockForConfiguration()
+                    if #available(iOS 16.0, *) {
+                        self.configurePreferredPhotoFormatIfAvailableLocked(
+                            for: selection.device,
+                            reason: "focalChangedSameDevice"
+                        )
+                    }
                     selection.device.videoZoomFactor = clampedZoom
                     selection.device.unlockForConfiguration()
+                    self.configurePreferredPhotoDimensions(
+                        for: selection.device,
+                        reason: "focalChangedSameDevice"
+                    )
                 } else {
                     RuntimeLog.info("[Session]", "beginConfiguration reason=focalChanged")
                     self.session.beginConfiguration()
@@ -527,6 +538,12 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                     RuntimeLog.info("[Session]", "inputAdded device=\(selection.deviceLabel)")
 
                     try selection.device.lockForConfiguration()
+                    if #available(iOS 16.0, *) {
+                        self.configurePreferredPhotoFormatIfAvailableLocked(
+                            for: selection.device,
+                            reason: "focalChanged"
+                        )
+                    }
                     selection.device.videoZoomFactor = clampedZoom
                     selection.device.unlockForConfiguration()
 
@@ -593,6 +610,10 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             "[Capture]",
             "start profile=\(profile.logName) focal=\(focal) format=\(format.label) orientation=\(orientation.rawValue)"
         )
+        await MainActor.run {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+        RuntimeLog.info("[Capture]", "feedbackIssued stage=shutter")
 
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             sessionQueue.async {
@@ -702,6 +723,12 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                         }
 
                         try selection.device.lockForConfiguration()
+                        if #available(iOS 16.0, *) {
+                            self.configurePreferredPhotoFormatIfAvailableLocked(
+                                for: selection.device,
+                                reason: "initialSetup"
+                            )
+                        }
                         selection.device.videoZoomFactor = selection.zoomFactor
                         selection.device.unlockForConfiguration()
 
@@ -922,22 +949,22 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             to: baseImage,
             focalLength: focalLength
         )
+        let normalizedProfiledImage = Self.normalizedImageExtent(profiledImage)
         RuntimeLog.info(
             "[QualityAudit]",
             "profileStage=\(filmProfile.logName) elapsed=\(Self.formatDuration(Self.now() - profileStartedAt)) input=\(cropDimensions)"
         )
 
-        let targetMinMP: CGFloat = 12_000_000
-        let targetMaxMP: CGFloat = 36_000_000
-        let inputWidth = CGFloat(profiledImage.extent.width)
-        let inputHeight = CGFloat(profiledImage.extent.height)
+        let targetOutputMP: CGFloat = 36_000_000
+        let inputWidth = CGFloat(normalizedProfiledImage.extent.width)
+        let inputHeight = CGFloat(normalizedProfiledImage.extent.height)
         let inputMP = inputWidth * inputHeight
 
         let requestedScaleFactor: CGFloat
-        if inputMP < targetMinMP * 0.95 {
-            requestedScaleFactor = min(2.0, sqrt(targetMinMP / inputMP))
-        } else if inputMP > targetMaxMP {
-            requestedScaleFactor = max(0.5, sqrt(targetMaxMP / inputMP))
+        if inputMP < targetOutputMP * 0.98 {
+            requestedScaleFactor = min(2.0, sqrt(targetOutputMP / inputMP))
+        } else if inputMP > targetOutputMP * 1.02 {
+            requestedScaleFactor = max(0.5, sqrt(targetOutputMP / inputMP))
         } else {
             requestedScaleFactor = 1.0
         }
@@ -947,29 +974,46 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         let resampledImage: CIImage
         let resizeDisposition: String
         if requestedScaleFactor > 1.02 {
-            resizeDisposition = "skipped"
-            RuntimeLog.info(
-                "[PhotoProcessing]",
-                "outputResize skipped reason=noUpscale source=\(Int(inputWidth))x\(Int(inputHeight)) target=\(requestedOutputWidth)x\(requestedOutputHeight)"
-            )
-            resampledImage = profiledImage
-        } else if requestedScaleFactor < 0.98 {
             if let scaleFilter = CIFilter(name: "CILanczosScaleTransform") {
-                scaleFilter.setValue(profiledImage, forKey: kCIInputImageKey)
+                let outputExtent = Self.scaledExtent(
+                    for: normalizedProfiledImage.extent,
+                    scale: requestedScaleFactor
+                )
+                scaleFilter.setValue(normalizedProfiledImage, forKey: kCIInputImageKey)
                 scaleFilter.setValue(requestedScaleFactor, forKey: kCIInputScaleKey)
                 scaleFilter.setValue(1.0, forKey: "inputAspectRatio")
-                resampledImage = scaleFilter.outputImage ?? profiledImage
+                resampledImage = (scaleFilter.outputImage ?? normalizedProfiledImage)
+                    .cropped(to: outputExtent)
             } else {
-                resampledImage = profiledImage
+                resampledImage = normalizedProfiledImage
             }
-            resizeDisposition = "applied"
+            resizeDisposition = "upscaled"
+            RuntimeLog.info(
+                "[PhotoProcessing]",
+                "outputResize applied reason=upscale source=\(Int(inputWidth))x\(Int(inputHeight)) target=\(requestedOutputWidth)x\(requestedOutputHeight)"
+            )
+        } else if requestedScaleFactor < 0.98 {
+            if let scaleFilter = CIFilter(name: "CILanczosScaleTransform") {
+                let outputExtent = Self.scaledExtent(
+                    for: normalizedProfiledImage.extent,
+                    scale: requestedScaleFactor
+                )
+                scaleFilter.setValue(normalizedProfiledImage, forKey: kCIInputImageKey)
+                scaleFilter.setValue(requestedScaleFactor, forKey: kCIInputScaleKey)
+                scaleFilter.setValue(1.0, forKey: "inputAspectRatio")
+                resampledImage = (scaleFilter.outputImage ?? normalizedProfiledImage)
+                    .cropped(to: outputExtent)
+            } else {
+                resampledImage = normalizedProfiledImage
+            }
+            resizeDisposition = "downscaled"
             RuntimeLog.info(
                 "[PhotoProcessing]",
                 "outputResize applied reason=downscale source=\(Int(inputWidth))x\(Int(inputHeight)) target=\(requestedOutputWidth)x\(requestedOutputHeight)"
             )
         } else {
             resizeDisposition = "native"
-            resampledImage = profiledImage
+            resampledImage = normalizedProfiledImage
         }
 
         let detailPlan = Self.detailProcessingPlan(
@@ -984,29 +1028,39 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         let denoisedImage: CIImage
         if detailPlan.shouldDenoise, let noiseFilter = CIFilter(name: "CINoiseReduction") {
-            noiseFilter.setValue(resampledImage, forKey: kCIInputImageKey)
+            noiseFilter.setValue(resampledImage.clampedToExtent(), forKey: kCIInputImageKey)
             noiseFilter.setValue(detailPlan.noiseLevel, forKey: "inputNoiseLevel")
             noiseFilter.setValue(0.0, forKey: "inputSharpness")
-            denoisedImage = noiseFilter.outputImage ?? resampledImage
+            denoisedImage = (noiseFilter.outputImage ?? resampledImage)
+                .cropped(to: resampledImage.extent)
         } else {
             denoisedImage = resampledImage
         }
 
         let finalImage: CIImage
         if let unsharpMask = CIFilter(name: "CIUnsharpMask") {
-            unsharpMask.setValue(denoisedImage, forKey: kCIInputImageKey)
+            unsharpMask.setValue(denoisedImage.clampedToExtent(), forKey: kCIInputImageKey)
             unsharpMask.setValue(detailPlan.sharpenRadius, forKey: "inputRadius")
             unsharpMask.setValue(detailPlan.sharpenIntensity, forKey: "inputIntensity")
-            finalImage = unsharpMask.outputImage ?? denoisedImage
+            finalImage = (unsharpMask.outputImage ?? denoisedImage)
+                .cropped(to: denoisedImage.extent)
         } else if let sharpenFilter = CIFilter(name: "CISharpenLuminance") {
-            sharpenFilter.setValue(denoisedImage, forKey: kCIInputImageKey)
+            sharpenFilter.setValue(denoisedImage.clampedToExtent(), forKey: kCIInputImageKey)
             sharpenFilter.setValue(detailPlan.sharpenIntensity, forKey: kCIInputSharpnessKey)
-            finalImage = sharpenFilter.outputImage ?? denoisedImage
+            finalImage = (sharpenFilter.outputImage ?? denoisedImage)
+                .cropped(to: denoisedImage.extent)
         } else {
             finalImage = denoisedImage
         }
 
-        guard let outputCGImage = photoCIContext.createCGImage(finalImage, from: finalImage.extent) else {
+        let renderImage = finalImage.transformed(
+            by: CGAffineTransform(
+                translationX: -finalImage.extent.origin.x,
+                y: -finalImage.extent.origin.y
+            )
+        )
+        let renderExtent = CGRect(origin: .zero, size: finalImage.extent.size)
+        guard let outputCGImage = photoCIContext.createCGImage(renderImage, from: renderExtent) else {
             await MainActor.run { captureError = "Failed to render final image" }
             RuntimeLog.error("[Error]", "finalImageRenderFailed")
             return
@@ -1397,6 +1451,12 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                 selection.device.maxAvailableVideoZoomFactor
             )
             try selection.device.lockForConfiguration()
+            if #available(iOS 16.0, *) {
+                configurePreferredPhotoFormatIfAvailableLocked(
+                    for: selection.device,
+                    reason: source
+                )
+            }
             selection.device.videoZoomFactor = clampedZoom
             selection.device.unlockForConfiguration()
             digitalZoomFactor = clampedZoom
@@ -1486,6 +1546,40 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    @available(iOS 16.0, *)
+    private func configurePreferredPhotoFormatIfAvailableLocked(
+        for device: AVCaptureDevice,
+        reason: String
+    ) {
+        let currentDimensions = Self.preferredPhotoDimensions(for: device.activeFormat)
+        let currentPixels = currentDimensions.map(Self.photoDimensionPixels) ?? 0
+
+        guard let candidate = Self.preferredPhotoFormat(for: device),
+              let candidateDimensions = Self.preferredPhotoDimensions(for: candidate) else {
+            RuntimeLog.info(
+                "[PhotoOutput]",
+                "activeFormatHighResUnavailable reason=\(reason) device=\(deviceLogName(for: device))"
+            )
+            return
+        }
+
+        let candidatePixels = Self.photoDimensionPixels(candidateDimensions)
+        guard candidatePixels > currentPixels else {
+            RuntimeLog.info(
+                "[PhotoOutput]",
+                "activeFormatKept reason=\(reason) device=\(deviceLogName(for: device)) selected=\(Self.photoDimensionsLogName(candidateDimensions)) mp=\(Self.format(CGFloat(candidatePixels) / 1_000_000.0))"
+            )
+            return
+        }
+
+        let previous = currentDimensions.map(Self.photoDimensionsLogName) ?? "unknown"
+        device.activeFormat = candidate
+        RuntimeLog.info(
+            "[PhotoOutput]",
+            "activeFormatChanged reason=\(reason) device=\(deviceLogName(for: device)) previous=\(previous) selected=\(Self.photoDimensionsLogName(candidateDimensions)) mp=\(Self.format(CGFloat(candidatePixels) / 1_000_000.0))"
+        )
+    }
+
     private func configurePreferredPhotoDimensions(
         for device: AVCaptureDevice,
         reason: String
@@ -1510,7 +1604,12 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
     @available(iOS 16.0, *)
     private static func preferredPhotoDimensions(for device: AVCaptureDevice) -> CMVideoDimensions? {
-        let supported = device.activeFormat.supportedMaxPhotoDimensions
+        preferredPhotoDimensions(for: device.activeFormat)
+    }
+
+    @available(iOS 16.0, *)
+    private static func preferredPhotoDimensions(for format: AVCaptureDevice.Format) -> CMVideoDimensions? {
+        let supported = format.supportedMaxPhotoDimensions
         guard !supported.isEmpty else { return nil }
 
         let sorted = supported.sorted {
@@ -1529,11 +1628,52 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         return sorted.last
     }
 
-    private static func photoDimensionPixels(_ dimensions: CMVideoDimensions) -> Int64 {
+    @available(iOS 16.0, *)
+    private static func preferredPhotoFormat(for device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        let nativeExperimentLimit = Int64(50_000_000)
+        let preferredMinimum = Int64(12_000_000)
+
+        return device.formats.compactMap { format -> (format: AVCaptureDevice.Format, dimensions: CMVideoDimensions, pixels: Int64)? in
+            guard let dimensions = preferredPhotoDimensions(for: format) else { return nil }
+            let pixels = photoDimensionPixels(dimensions)
+            guard pixels >= preferredMinimum && pixels <= nativeExperimentLimit else { return nil }
+            return (format, dimensions, pixels)
+        }
+        .max { lhs, rhs in
+            if lhs.pixels != rhs.pixels {
+                return lhs.pixels < rhs.pixels
+            }
+            return lhs.format.videoFieldOfView < rhs.format.videoFieldOfView
+        }?
+        .format
+    }
+
+    nonisolated private static func photoDimensionPixels(_ dimensions: CMVideoDimensions) -> Int64 {
         Int64(dimensions.width) * Int64(dimensions.height)
     }
 
-    private static func photoDimensionsLogName(_ dimensions: CMVideoDimensions) -> String {
+    nonisolated private static func normalizedImageExtent(_ image: CIImage) -> CIImage {
+        let extent = image.extent
+        guard extent.origin != .zero else { return image }
+
+        return image.transformed(
+            by: CGAffineTransform(
+                translationX: -extent.origin.x,
+                y: -extent.origin.y
+            )
+        )
+    }
+
+    nonisolated private static func scaledExtent(for extent: CGRect, scale: CGFloat) -> CGRect {
+        CGRect(
+            x: (extent.origin.x * scale).rounded(.down),
+            y: (extent.origin.y * scale).rounded(.down),
+            width: max(1, (extent.width * scale).rounded()),
+            height: max(1, (extent.height * scale).rounded())
+        )
+    }
+
+    nonisolated private static func photoDimensionsLogName(_ dimensions: CMVideoDimensions) -> String {
         "\(dimensions.width)x\(dimensions.height)"
     }
 
@@ -1572,11 +1712,11 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             profileMultiplier = 1.00
             radius = focalLength == 105 ? 1.00 : 1.30
         case .vg:
-            profileMultiplier = 0.88
-            radius = focalLength == 105 ? 0.90 : 1.15
+            profileMultiplier = focalLength == 105 ? 0.82 : 0.88
+            radius = focalLength == 105 ? 0.82 : 1.15
         case .ew:
-            profileMultiplier = 0.42
-            radius = 0.65
+            profileMultiplier = focalLength == 105 ? 0.62 : 0.42
+            radius = focalLength == 105 ? 0.72 : 0.65
         }
 
         let isoAttenuation = Float(max(0.35, 1.0 - max(0.0, Double(iso) - 160.0) / 1000.0))
@@ -1586,7 +1726,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         switch profile {
         case .raw: denoiseThreshold = 280
         case .vg: denoiseThreshold = 220
-        case .ew: denoiseThreshold = 500
+        case .ew: denoiseThreshold = 1000
         }
 
         let shouldDenoise = iso > denoiseThreshold
@@ -1594,11 +1734,13 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         if shouldDenoise {
             let base: Float = {
                 switch profile {
-                case .ew: return 0.006
+                case .ew: return 0.003
                 case .raw, .vg: return 0.008
                 }
             }()
-            let extra = min(0.030, max(0.0, Float(iso - denoiseThreshold) / 28_000.0))
+            let extraLimit: Float = profile == .ew ? 0.016 : 0.030
+            let extraDivisor: Float = profile == .ew ? 42_000.0 : 28_000.0
+            let extra = min(extraLimit, max(0.0, Float(iso - denoiseThreshold) / extraDivisor))
             noiseLevel = base + extra
         } else {
             noiseLevel = 0

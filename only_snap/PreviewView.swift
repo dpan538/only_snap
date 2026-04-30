@@ -531,6 +531,20 @@ extension FilmPreviewUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
     ) -> Bool {
         guard state.awaitingFirstRenderableFrame else { return false }
 
+        let samplePTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if samplePTS.isValid,
+           state.minimumFramePTS.isValid,
+           CMTimeCompare(samplePTS, state.minimumFramePTS) < 0 {
+            if lastStaleDropGeneration != state.generation {
+                lastStaleDropGeneration = state.generation
+                RuntimeLog.info(
+                    "[PreviewRender]",
+                    "droppedStaleFrame frameGeneration=\(max(0, state.generation - 1)) currentGeneration=\(state.generation) reason=olderThanPublishedState"
+                )
+            }
+            return true
+        }
+
         let actualAngle = Int(connection.videoRotationAngle.rounded())
         let expectedAngle = Int(state.orientation.videoOutputRotationAngle.rounded())
         if actualAngle != expectedAngle {

@@ -22,15 +22,26 @@ enum EWProcessor {
         }
 
         nonisolated var isHighContrast: Bool {
-            contrastIndex > 0.22 || (topLuma > 0.62 && centerLuma < 0.42)
+            contrastIndex > 0.18
+                || (topLuma > 0.62 && centerLuma < 0.42)
+                || isShadowStructured
+                || isBrightHighDynamicRange
         }
 
         nonisolated var isLowContrast: Bool {
-            contrastIndex < 0.08 && averageLuma > 0.22 && averageLuma < 0.76
+            contrastIndex < 0.045 && averageLuma > 0.25 && averageLuma < 0.72
         }
 
         nonisolated var isDark: Bool {
             averageLuma < 0.24
+        }
+
+        nonisolated var isShadowStructured: Bool {
+            averageLuma < 0.52 && centerLuma < 0.48 && contrastIndex > 0.10
+        }
+
+        nonisolated var isBrightHighDynamicRange: Bool {
+            topLuma > 0.70 && contrastIndex > 0.12
         }
     }
 
@@ -46,6 +57,9 @@ enum EWProcessor {
 
     nonisolated static func preheatResources() {
         _ = ewToneCubeData()
+        let sample = CIImage(color: CIColor(red: 0.62, green: 0.62, blue: 0.60))
+            .cropped(to: CGRect(x: 0, y: 0, width: 64, height: 64))
+        renderWarmup(apply(to: sample))
     }
 
     nonisolated static func apply(to image: CIImage) -> CIImage {
@@ -159,30 +173,36 @@ enum EWProcessor {
         let p3: CGFloat
         let p4: CGFloat
 
-        if scene.isHighContrast {
+        if scene.isBrightHighDynamicRange {
+            p0 = 0.012
+            p1 = 0.178
+            p2 = 0.515
+            p3 = 0.835
+            p4 = 0.980
+        } else if scene.isHighContrast {
             p0 = 0.010
-            p1 = 0.170
-            p2 = 0.510
-            p3 = 0.820
-            p4 = 0.965
+            p1 = 0.175
+            p2 = 0.515
+            p3 = 0.835
+            p4 = 0.975
         } else if scene.isLowContrast {
-            p0 = 0.020
-            p1 = 0.235
+            p0 = 0.018
+            p1 = 0.225
             p2 = 0.535
-            p3 = 0.805
-            p4 = 0.965
+            p3 = 0.830
+            p4 = 0.972
         } else if scene.isDark {
             p0 = 0.018
-            p1 = 0.220
+            p1 = 0.210
             p2 = 0.520
-            p3 = 0.800
-            p4 = 0.955
+            p3 = 0.815
+            p4 = 0.965
         } else {
             p0 = 0.015
             p1 = 0.215
             p2 = 0.515
-            p3 = 0.805
-            p4 = 0.965
+            p3 = 0.820
+            p4 = 0.972
         }
 
         toneCurve.setValue(CIVector(x: 0.00, y: p0), forKey: "inputPoint0")
@@ -197,8 +217,8 @@ enum EWProcessor {
         guard let controls = CIFilter(name: "CIColorControls") else { return image }
         controls.setValue(image, forKey: kCIInputImageKey)
         controls.setValue(0.0, forKey: kCIInputSaturationKey)
-        controls.setValue(scene.isLowContrast ? 0.008 : 0.004, forKey: kCIInputBrightnessKey)
-        controls.setValue(scene.isHighContrast ? 0.99 : (scene.isLowContrast ? 0.91 : 0.95), forKey: kCIInputContrastKey)
+        controls.setValue(scene.isLowContrast ? 0.004 : 0.002, forKey: kCIInputBrightnessKey)
+        controls.setValue(scene.isHighContrast ? 1.02 : (scene.isLowContrast ? 0.98 : 0.99), forKey: kCIInputContrastKey)
         return controls.outputImage ?? image
     }
 
@@ -253,5 +273,17 @@ enum EWProcessor {
         }
 
         return normalizedInput
+    }
+
+    nonisolated private static func renderWarmup(_ image: CIImage) {
+        var px = [UInt8](repeating: 0, count: 4)
+        analysisCIContext.render(
+            image,
+            toBitmap: &px,
+            rowBytes: 4,
+            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            format: .RGBA8,
+            colorSpace: CGColorSpaceCreateDeviceRGB()
+        )
     }
 }
