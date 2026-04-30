@@ -82,6 +82,14 @@ enum CropManager {
             // With .right rotation: display = 2688 × 4032 = 2:3 portrait ✓
             targetWidth  = srcW
             targetHeight = srcW * (2.0 / 3.0)
+
+        case .cinematicWide:
+            // Display 2.39:1 after the right-rotation metadata:
+            //   display width = srcH, display height = cropped srcW
+            // therefore cropped srcW = srcH / 2.39.
+            // This is intentionally a narrow cinema crop, paired with 28mm capture.
+            targetWidth = srcH / 2.39
+            targetHeight = srcH
         }
 
         let x = (srcW - targetWidth)  / 2.0

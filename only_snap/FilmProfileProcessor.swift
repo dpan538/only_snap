@@ -14,14 +14,19 @@ enum FilmProfileProcessor {
         }
     }
 
-    nonisolated static func apply(profile: FilmProfile, to image: CIImage, focalLength: Int = 35) -> CIImage {
+    nonisolated static func apply(
+        profile: FilmProfile,
+        to image: CIImage,
+        focalLength: Int = 28,
+        isPreview: Bool = false
+    ) -> CIImage {
         switch profile {
         case .raw:
             return image
         case .vg:
             return VGProcessor.apply(to: image, focalLength: focalLength)
         case .ew:
-            return EWProcessor.apply(to: image)
+            return EWProcessor.apply(to: image, focalLength: focalLength, useFastAnalysis: isPreview)
         }
     }
 }

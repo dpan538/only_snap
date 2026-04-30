@@ -24,16 +24,33 @@ enum Theme {
     // MARK: - Layout
     enum Layout {
         // Portrait
-        static let vfHPad: CGFloat            = 30
-        static let vfTopOffset: CGFloat       = 40
-        static let btnSize: CGFloat           = 66
-        static let shutterOuter: CGFloat      = 110
-        static let shutterInner: CGFloat      = 90
-        static let formatUpLift: CGFloat      = 70
+        static let vfHPad: CGFloat            = 24
+        static let viewfinderTargetWidth: CGFloat = 342
+        static let topHUDTopLift: CGFloat     = 49
+        static let topHUDToViewfinder: CGFloat = 19
+        static let viewfinderToFocal: CGFloat = 10
+        static let topHUDHeight: CGFloat      = 44
+        static let histogramWidth: CGFloat    = 104
+        static let topHUDSpacing: CGFloat     = 30
+        static let proCapsuleHeight: CGFloat  = 34
+        static let proCapsuleHitHeight: CGFloat = 44
+        static let proCapsuleCornerRadius: CGFloat = 12
+        static let btnSize: CGFloat           = 70.3
+        static let btnHitSize: CGFloat        = 84
+        static let sideButtonSpacing: CGFloat = 10
+        static let shutterOuter: CGFloat      = 100
+        static let shutterInner: CGFloat      = 78
+        static let shutterHitSize: CGFloat    = 112
+        static let aspectButtonWidth: CGFloat = 58
+        static let aspectButtonHeight: CGFloat = 46
         static let swipeThreshold: CGFloat    = 45
-        static let focalToButtons: CGFloat    = 30
-        static let controlsBottomPad: CGFloat = 48
-        static let controlsExtraDown: CGFloat = 20
+        static let focalRowHeight: CGFloat    = 52
+        static let focalToButtons: CGFloat    = 17
+        static let controlsBottomPad: CGFloat = 33
+        static let controlsSafeBottomInset: CGFloat = 1
+        static let focalReferenceButtonSize: CGFloat = 74
+        static let focalReferenceControlsBottomPad: CGFloat = 39
+        static let focalReferenceControlsSafeBottomInset: CGFloat = 7
 
         // Reserved layout constants from the original camera UI exploration.
         static let lsStripWidth: CGFloat      = 108
@@ -50,12 +67,18 @@ enum AspectFormat: CaseIterable, Sendable {
     case square       // 1:1
     case threeToFour  // 3:4
     case twoToThree   // 2:3
+    case cinematicWide // 2.39:1
+
+    nonisolated static var standardCases: [AspectFormat] {
+        [.square, .threeToFour, .twoToThree]
+    }
 
     nonisolated var label: String {
         switch self {
         case .square:      return "1:1"
         case .threeToFour: return "3:4"
         case .twoToThree:  return "2:3"
+        case .cinematicWide: return "2.39"
         }
     }
 
@@ -64,6 +87,7 @@ enum AspectFormat: CaseIterable, Sendable {
         case .square:      return 1.0
         case .threeToFour: return 4.0 / 3.0
         case .twoToThree:  return 3.0 / 2.0
+        case .cinematicWide: return 1.0 / 2.39
         }
     }
 
@@ -74,12 +98,20 @@ enum AspectFormat: CaseIterable, Sendable {
     }
 
     nonisolated func next() -> AspectFormat {
-        let all = AspectFormat.allCases
-        return all[(all.firstIndex(of: self)! + 1) % all.count]
+        switch self {
+        case .square: return .threeToFour
+        case .threeToFour: return .twoToThree
+        case .twoToThree: return .square
+        case .cinematicWide: return .threeToFour
+        }
     }
 
     nonisolated func previous() -> AspectFormat {
-        let all = AspectFormat.allCases
-        return all[(all.firstIndex(of: self)! - 1 + all.count) % all.count]
+        switch self {
+        case .square: return .twoToThree
+        case .threeToFour: return .square
+        case .twoToThree: return .threeToFour
+        case .cinematicWide: return .twoToThree
+        }
     }
 }

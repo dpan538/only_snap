@@ -19,9 +19,15 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     @Published private(set) var pendingFilmProfile: FilmProfile?
     @Published private(set) var isVGReady = false
     @Published private(set) var isEWReady = false
-    @Published private(set) var selectedFocalLength = 35
+    @Published private(set) var selectedFocalLength = 28
     @Published private(set) var selectedAspectFormat: AspectFormat = .threeToFour
     @Published private(set) var flashEnabled = false
+    @Published private(set) var captureOutputKind: CaptureOutputKind = .jpg
+    @Published private(set) var isAELocked = false
+    @Published private(set) var meteringMode: MeteringMode = .matrix
+    @Published private(set) var isWidescreenEnabled = false
+    @Published private(set) var availableFocalLengths: [Int] = [15, 28, 43, 85]
+    @Published private(set) var histogramSamples: [CGFloat] = CameraManager.defaultHistogramSamples
     @Published private(set) var cameraOrientation: CameraOrientationState = .portrait
     @Published private(set) var previewGeneration = 0
     @Published private(set) var isPreviewTransitioning = false
@@ -50,8 +56,12 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     // MARK: - Session-owned state
 
     nonisolated(unsafe) private var isSessionConfigured = false
-    nonisolated(unsafe) private var sessionSelectedFocalLength = 35
+    nonisolated(unsafe) private var sessionSelectedFocalLength = 28
     nonisolated(unsafe) private var sessionFlashEnabled = false
+    nonisolated(unsafe) private var sessionAELocked = false
+    nonisolated(unsafe) private var sessionMeteringMode = MeteringMode.matrix
+    nonisolated(unsafe) private var sessionMeteringBias: Float = 0
+    nonisolated(unsafe) private var sessionCaptureOutputKind = CaptureOutputKind.jpg
     nonisolated(unsafe) private var sessionOrientation = CameraOrientationState.portrait
     nonisolated(unsafe) private var lastAppliedOrientationState: CameraOrientationState?
     nonisolated(unsafe) private var lastAppliedVideoOutputAngle: CGFloat?
@@ -59,6 +69,10 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     nonisolated(unsafe) private var captureCropFactor: CGFloat = 1.0
     nonisolated(unsafe) private var digitalZoomFactor: CGFloat = 1.0
     nonisolated(unsafe) private var sessionMaxPhotoDimensions: CMVideoDimensions?
+    nonisolated(unsafe) private var cameraCapabilities = CameraCapabilities.empty
+    nonisolated(unsafe) private var lastHistogramUpdateAt: TimeInterval = 0
+    nonisolated(unsafe) private var lastMeteringBiasUpdateAt: TimeInterval = 0
+    private var previousStandardAspectFormat: AspectFormat = .threeToFour
 
     // MARK: - Observers / delegates
 
@@ -84,6 +98,16 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     nonisolated(unsafe) private var pendingFocalTransition: PendingFocalTransition?
     nonisolated(unsafe) private var startupStartRunningEndedAt: TimeInterval?
     private static let outputJPEGQuality: CGFloat = 0.95
+    private static let outputHEIFQuality: CGFloat = 0.93
+    private static let nominalUltraWideEquivalent: CGFloat = 15
+    private static let nominalWideEquivalent: CGFloat = 28
+    private static let nominalTeleShortEquivalent: CGFloat = 77
+    private static let nominalTeleLongEquivalent: CGFloat = 120
+    static let defaultHistogramSamples: [CGFloat] = [
+        0.40, 0.46, 0.44, 0.52, 0.50, 0.58, 0.62, 0.56,
+        0.48, 0.44, 0.50, 0.60, 0.72, 0.66, 0.54, 0.46,
+        0.42, 0.36
+    ]
 
     private struct PendingOrientationTransition {
         let from: CameraOrientationState
@@ -114,6 +138,33 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         let noiseLevel: Float
         let shouldDenoise: Bool
         let reason: String
+    }
+
+    private struct CameraCapabilities {
+        let hasUltraWide: Bool
+        let hasWide: Bool
+        let hasTelephoto: Bool
+        let telephoto35mmEquivalent: CGFloat?
+        let wide35mmEquivalent: CGFloat
+        let ultraWide35mmEquivalent: CGFloat?
+        let virtualSwitchFactors: [CGFloat]
+
+        static let empty = CameraCapabilities(
+            hasUltraWide: false,
+            hasWide: false,
+            hasTelephoto: false,
+            telephoto35mmEquivalent: nil,
+            wide35mmEquivalent: 24,
+            ultraWide35mmEquivalent: nil,
+            virtualSwitchFactors: []
+        )
+
+        var supportedFocalLengths: [Int] {
+            if hasTelephoto {
+                return [15, 28, 43, 77, 120]
+            }
+            return [15, 28, 43, 85]
+        }
     }
 
     // MARK: - Rendering
@@ -275,15 +326,116 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
     func setAspectFormat(_ format: AspectFormat) {
         guard format != selectedAspectFormat else { return }
+        if format == .cinematicWide {
+            isWidescreenEnabled = true
+        } else {
+            previousStandardAspectFormat = format
+            isWidescreenEnabled = false
+        }
         selectedAspectFormat = format
         bumpPreviewGeneration(reason: "aspectFormatChanged")
         RuntimeLog.info("[Preview]", "aspectFormat=\(format.label)")
+    }
+
+    func toggleWidescreenMode() {
+        let next = !isWidescreenEnabled
+        isWidescreenEnabled = next
+
+        if next {
+            if selectedAspectFormat != .cinematicWide {
+                if selectedAspectFormat != .cinematicWide {
+                    previousStandardAspectFormat = selectedAspectFormat
+                }
+                selectedAspectFormat = .cinematicWide
+                bumpPreviewGeneration(reason: "widescreenChanged")
+            }
+            RuntimeLog.info("[Preview]", "widescreen=true aspect=2.39 focal=28")
+            if selectedFocalLength != 28 {
+                setFocalLength(28)
+            }
+        } else {
+            let restoreFormat = previousStandardAspectFormat == .cinematicWide
+                ? AspectFormat.threeToFour
+                : previousStandardAspectFormat
+            selectedAspectFormat = restoreFormat
+            bumpPreviewGeneration(reason: "widescreenChanged")
+            RuntimeLog.info("[Preview]", "widescreen=false aspect=\(restoreFormat.label)")
+        }
     }
 
     func setFlashEnabled(_ enabled: Bool) {
         flashEnabled = enabled
         sessionFlashEnabled = enabled
         RuntimeLog.info("[Capture]", "flashEnabled=\(enabled)")
+    }
+
+    func cycleCaptureOutputKind() {
+        let next = captureOutputKind.next
+        captureOutputKind = next
+        sessionCaptureOutputKind = next
+        RuntimeLog.info("[Capture]", "outputKind=\(next.logName)")
+    }
+
+    func toggleAELock() {
+        let target = !isAELocked
+        sessionQueue.async {
+            guard let device = self.currentDevice else {
+                DispatchQueue.main.async {
+                    self.captureError = "No active camera for AE lock"
+                }
+                RuntimeLog.error("[Error]", "aeLockFailed reason=noCurrentDevice")
+                return
+            }
+
+            do {
+                try device.lockForConfiguration()
+                let applied: Bool
+                do {
+                    defer { device.unlockForConfiguration() }
+                    if target {
+                        applied = self.applyExposureLockLocked(to: device, locked: true)
+                    } else {
+                        _ = self.applyExposureLockLocked(to: device, locked: false)
+                        self.applyMeteringModeLocked(to: device, mode: self.sessionMeteringMode)
+                        applied = false
+                    }
+                }
+                self.sessionAELocked = applied
+                DispatchQueue.main.async {
+                    self.isAELocked = applied
+                }
+                RuntimeLog.info(
+                    "[Exposure]",
+                    "aeLockRequested=\(target) applied=\(applied) mode=\(device.exposureMode.rawValue)"
+                )
+            } catch {
+                DispatchQueue.main.async {
+                    self.captureError = error.localizedDescription
+                }
+                RuntimeLog.error("[Error]", "aeLockFailed error=\(error.localizedDescription)")
+            }
+        }
+    }
+
+    func cycleMeteringMode() {
+        let next = meteringMode.next
+        meteringMode = next
+        sessionMeteringMode = next
+        RuntimeLog.info("[Exposure]", "meteringMode=\(next.logName)")
+
+        sessionQueue.async {
+            guard let device = self.currentDevice else { return }
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                self.applyMeteringModeLocked(to: device, mode: next)
+                if self.sessionAELocked {
+                    _ = self.applyExposureLockLocked(to: device, locked: true)
+                }
+            } catch {
+                RuntimeLog.error("[Error]", "meteringModeApplyFailed error=\(error.localizedDescription)")
+            }
+        }
     }
 
     func requestFilmProfile(_ profile: FilmProfile) {
@@ -302,7 +454,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         case .raw:
             pendingFilmProfile = nil
             activeFilmProfile = .raw
-            RuntimeLog.info("[FilmProfile]", "requested=raw active=raw ready=true")
+            RuntimeLog.info("[FilmProfile]", "requested=sd active=sd ready=true")
         case .vg:
             if isVGReady {
                 pendingFilmProfile = nil
@@ -315,7 +467,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             } else {
                 pendingFilmProfile = .vg
                 preheatVGResourcesIfNeeded()
-                RuntimeLog.info("[FilmProfile]", "requested=vg active=raw ready=false pending=true")
+                RuntimeLog.info("[FilmProfile]", "requested=vg active=\(activeFilmProfile.logName) ready=false pending=true")
             }
         case .ew:
             if isEWReady {
@@ -400,6 +552,53 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    nonisolated func updatePreviewHistogram(from pixelBuffer: CVPixelBuffer) {
+        let now = Self.now()
+        guard now - lastHistogramUpdateAt >= 0.10 else { return }
+        lastHistogramUpdateAt = now
+
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        guard pixelFormat == kCVPixelFormatType_32BGRA else { return }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let buffer = baseAddress.assumingMemoryBound(to: UInt8.self)
+
+        let bucketCount = 24
+        var buckets = Array(repeating: 0, count: bucketCount)
+        let stepX = max(1, width / 48)
+        let stepY = max(1, height / 32)
+
+        var y = 0
+        while y < height {
+            var x = 0
+            while x < width {
+                let offset = y * bytesPerRow + x * 4
+                let blue = CGFloat(buffer[offset]) / 255.0
+                let green = CGFloat(buffer[offset + 1]) / 255.0
+                let red = CGFloat(buffer[offset + 2]) / 255.0
+                let luma = (0.2126 * red + 0.7152 * green + 0.0722 * blue).clamped(to: 0...1)
+                let index = min(bucketCount - 1, Int(luma * CGFloat(bucketCount)))
+                buckets[index] += 1
+                x += stepX
+            }
+            y += stepY
+        }
+
+        let maxCount = max(1, buckets.max() ?? 1)
+        let normalized = buckets.map { CGFloat($0) / CGFloat(maxCount) }
+        updateAdaptiveMeteringBiasIfNeeded(buckets: buckets, now: now)
+
+        DispatchQueue.main.async { [weak self] in
+            self?.histogramSamples = normalized
+        }
+    }
+
     func notifyFirstPreviewFrame() {
         guard !didReportFirstPreviewFrame else { return }
         didReportFirstPreviewFrame = true
@@ -415,6 +614,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             )
         }
         preheatVGResourcesIfNeeded()
+        preheatEWResourcesIfNeeded()
     }
 
     func notifyPreviewFrameRendered(
@@ -498,22 +698,21 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                 )
             }
 
-            let clampedZoom = min(
-                max(selection.zoomFactor, selection.device.minAvailableVideoZoomFactor),
-                selection.device.maxAvailableVideoZoomFactor
-            )
+            var zoomCalibration: ZoomCalibration?
 
             do {
                 if selection.device.uniqueID == previousDeviceID {
                     try selection.device.lockForConfiguration()
-                    if #available(iOS 16.0, *) {
-                        self.configurePreferredPhotoFormatIfAvailableLocked(
+                    let calibration: ZoomCalibration
+                    do {
+                        defer { selection.device.unlockForConfiguration() }
+                        calibration = self.applyPreferredFormatAndZoomLocked(
                             for: selection.device,
+                            targetFocalLength: mm,
                             reason: "focalChangedSameDevice"
                         )
                     }
-                    selection.device.videoZoomFactor = clampedZoom
-                    selection.device.unlockForConfiguration()
+                    zoomCalibration = calibration
                     self.configurePreferredPhotoDimensions(
                         for: selection.device,
                         reason: "focalChangedSameDevice"
@@ -538,14 +737,16 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                     RuntimeLog.info("[Session]", "inputAdded device=\(selection.deviceLabel)")
 
                     try selection.device.lockForConfiguration()
-                    if #available(iOS 16.0, *) {
-                        self.configurePreferredPhotoFormatIfAvailableLocked(
+                    let calibration: ZoomCalibration
+                    do {
+                        defer { selection.device.unlockForConfiguration() }
+                        calibration = self.applyPreferredFormatAndZoomLocked(
                             for: selection.device,
+                            targetFocalLength: mm,
                             reason: "focalChanged"
                         )
                     }
-                    selection.device.videoZoomFactor = clampedZoom
-                    selection.device.unlockForConfiguration()
+                    zoomCalibration = calibration
 
                     self.configurePreferredPhotoDimensions(
                         for: selection.device,
@@ -565,7 +766,8 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             }
 
             self.captureCropFactor = 1.0
-            self.digitalZoomFactor = clampedZoom
+            let appliedZoom = zoomCalibration?.zoomFactor ?? selection.zoomFactor
+            self.digitalZoomFactor = appliedZoom
             self.sessionSelectedFocalLength = mm
             self.applyCameraOrientation(reason: "focalChanged")
 
@@ -587,9 +789,12 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             }
 
             let reason = selection.fallbackReason ?? "none"
+            let focalCalibration = zoomCalibration.map {
+                " base=\(Self.format($0.baseEquivalentFocalLength)) actual=\(Self.format($0.actualEquivalentFocalLength)) error=\(Self.format($0.errorRatio * 100))%"
+            } ?? ""
             RuntimeLog.info(
                 "[Focal]",
-                "requested=\(mm) resolvedDevice=\(self.deviceLogName(for: selection.device)) position=\(self.positionLogName(for: selection.device)) zoom=\(Self.format(clampedZoom)) fallback=\(selection.isFallback) reason=\(reason) elapsed=\(Self.formatDuration(Self.now() - requestStartedAt))"
+                "requested=\(mm) resolvedDevice=\(self.deviceLogName(for: selection.device)) position=\(self.positionLogName(for: selection.device)) zoom=\(Self.format(appliedZoom))\(focalCalibration) fallback=\(selection.isFallback) reason=\(reason) elapsed=\(Self.formatDuration(Self.now() - requestStartedAt))"
             )
         }
     }
@@ -603,12 +808,13 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         let profile = activeFilmProfile
         let format = selectedAspectFormat
         let orientation = cameraOrientation
+        let outputKind = captureOutputKind
         let deviceHasFlash = currentDevice?.hasFlash ?? false
         let captureStartedAt = Self.now()
 
         RuntimeLog.info(
             "[Capture]",
-            "start profile=\(profile.logName) focal=\(focal) format=\(format.label) orientation=\(orientation.rawValue)"
+            "start profile=\(profile.logName) focal=\(focal) format=\(format.label) output=\(outputKind.logName) orientation=\(orientation.rawValue)"
         )
         await MainActor.run {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -637,9 +843,22 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                     return
                 }
 
-                let settings = AVCapturePhotoSettings()
+                let settings: AVCapturePhotoSettings
+                do {
+                    settings = try self.photoSettings(for: outputKind)
+                } catch {
+                    DispatchQueue.main.async {
+                        self.captureError = error.localizedDescription
+                    }
+                    RuntimeLog.error("[Error]", "captureFailed error=\(error.localizedDescription)")
+                    cont.resume()
+                    return
+                }
                 settings.flashMode = (flashEnabled && deviceHasFlash) ? .on : .off
                 settings.photoQualityPrioritization = .quality
+                if self.photoOutput.isCameraCalibrationDataDeliverySupported {
+                    settings.isCameraCalibrationDataDeliveryEnabled = true
+                }
                 if #available(iOS 16.0, *), let maxDimensions = self.sessionMaxPhotoDimensions {
                     settings.maxPhotoDimensions = maxDimensions
                     RuntimeLog.info(
@@ -657,7 +876,9 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                 let delegate = PhotoCaptureDelegate(
                     format: format,
                     filmProfile: profile,
+                    outputKind: outputKind,
                     cropFactor: cropFactor,
+                    digitalZoomFactor: self.digitalZoomFactor,
                     focalLength: focal,
                     captureStartedAt: captureStartedAt,
                     cameraManager: self,
@@ -674,6 +895,19 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     // MARK: - Session configuration
+
+    private func photoSettings(for outputKind: CaptureOutputKind) throws -> AVCapturePhotoSettings {
+        switch outputKind {
+        case .jpg, .heif:
+            return AVCapturePhotoSettings()
+
+        case .dng:
+            guard let rawPixelFormat = photoOutput.availableRawPhotoPixelFormatTypes.first else {
+                throw CameraError.dngUnsupported
+            }
+            return AVCapturePhotoSettings(rawPixelFormatType: rawPixelFormat)
+        }
+    }
 
     private func configureSessionIfNeeded() async {
         await withCheckedContinuation { cont in
@@ -723,17 +957,18 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                         }
 
                         try selection.device.lockForConfiguration()
-                        if #available(iOS 16.0, *) {
-                            self.configurePreferredPhotoFormatIfAvailableLocked(
+                        let calibration: ZoomCalibration
+                        do {
+                            defer { selection.device.unlockForConfiguration() }
+                            calibration = self.applyPreferredFormatAndZoomLocked(
                                 for: selection.device,
+                                targetFocalLength: self.sessionSelectedFocalLength,
                                 reason: "initialSetup"
                             )
                         }
-                        selection.device.videoZoomFactor = selection.zoomFactor
-                        selection.device.unlockForConfiguration()
 
                         self.captureCropFactor = 1.0
-                        self.digitalZoomFactor = selection.zoomFactor
+                        self.digitalZoomFactor = calibration.zoomFactor
                         configuredCaptureDevice = selection.device
 
                         DispatchQueue.main.async {
@@ -912,15 +1147,45 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         _ photo: AVCapturePhoto,
         format: AspectFormat,
         filmProfile: FilmProfile,
+        outputKind: CaptureOutputKind,
         cropFactor: CGFloat,
+        digitalZoomFactor: CGFloat,
         focalLength: Int,
         captureStartedAt: TimeInterval
     ) async {
         let processingStartedAt = Self.now()
         RuntimeLog.info(
             "[PhotoProcessing]",
-            "start profile=\(filmProfile.logName) focal=\(focalLength) format=\(format.label)"
+            "start profile=\(filmProfile.logName) focal=\(focalLength) format=\(format.label) output=\(outputKind.logName)"
         )
+
+        if outputKind == .dng {
+            guard let dngData = photo.fileDataRepresentation() else {
+                await MainActor.run { captureError = "Failed to extract DNG data" }
+                RuntimeLog.error("[Error]", "dngExtractionFailed")
+                return
+            }
+
+            do {
+                RuntimeLog.info("[Capture]", "saveStarted output=dng")
+                try await savePhotoDataToLibrary(dngData)
+                await MainActor.run {
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                }
+                RuntimeLog.info(
+                    "[PhotoProcessing]",
+                    "completed output=dng bytes=\(dngData.count) elapsed=\(Self.formatDuration(Self.now() - processingStartedAt))"
+                )
+                RuntimeLog.info(
+                    "[Capture]",
+                    "saveCompleted totalElapsed=\(Self.formatDuration(Self.now() - captureStartedAt))"
+                )
+            } catch {
+                await MainActor.run { captureError = error.localizedDescription }
+                RuntimeLog.error("[Error]", "dngSaveFailed error=\(error.localizedDescription)")
+            }
+            return
+        }
 
         guard let cgImage = photo.cgImageRepresentation() else {
             await MainActor.run { captureError = "Failed to extract image data" }
@@ -942,7 +1207,11 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             "profile=\(filmProfile.logName) focal=\(focalLength) format=\(format.label) iso=\(Self.format(isoValue)) exposure=\(Self.formatExposure(qualityMetrics.exposureSeconds)) fNumber=\(Self.formatOptional(qualityMetrics.fNumber)) brightness=\(Self.formatOptional(qualityMetrics.brightnessValue)) wb=\(Self.whiteBalanceLogName(qualityMetrics.whiteBalance)) source=\(sourceDimensions) crop=\(cropDimensions)"
         )
 
-        let baseImage = CIImage(cgImage: cropped)
+        let baseImage = correctDistortionIfNeeded(
+            CIImage(cgImage: cropped),
+            photo: photo,
+            focalLength: focalLength
+        )
         let profileStartedAt = Self.now()
         let profiledImage = FilmProfileProcessor.apply(
             profile: filmProfile,
@@ -1019,11 +1288,12 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         let detailPlan = Self.detailProcessingPlan(
             profile: filmProfile,
             focalLength: focalLength,
+            digitalZoomFactor: digitalZoomFactor,
             iso: isoValue
         )
         RuntimeLog.info(
             "[DetailPipeline]",
-            "profile=\(filmProfile.logName) focal=\(focalLength) iso=\(Self.format(isoValue)) order=denoiseThenSharpen sharpen=\(Self.format(CGFloat(detailPlan.sharpenIntensity))) radius=\(Self.format(CGFloat(detailPlan.sharpenRadius))) denoise=\(detailPlan.shouldDenoise ? Self.format(CGFloat(detailPlan.noiseLevel)) : "off") reason=\(detailPlan.reason)"
+            "profile=\(filmProfile.logName) focal=\(focalLength) zoom=\(Self.format(digitalZoomFactor)) iso=\(Self.format(isoValue)) order=denoiseThenSharpen sharpen=\(Self.format(CGFloat(detailPlan.sharpenIntensity))) radius=\(Self.format(CGFloat(detailPlan.sharpenRadius))) denoise=\(detailPlan.shouldDenoise ? Self.format(CGFloat(detailPlan.noiseLevel)) : "off") reason=\(detailPlan.reason)"
         )
 
         let denoisedImage: CIImage
@@ -1068,18 +1338,18 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         let outputDimensions = "\(outputCGImage.width)x\(outputCGImage.height)"
         RuntimeLog.info(
             "[PhotoProcessing]",
-            "profile=\(filmProfile.logName) format=\(format.label) source=\(sourceDimensions) crop=\(cropDimensions) output=\(outputDimensions) resize=\(resizeDisposition) jpegQuality=\(Self.format(Self.outputJPEGQuality))"
-        )
-        RuntimeLog.info(
-            "[PhotoProcessing]",
-            "jpegQuality=\(Self.format(Self.outputJPEGQuality))"
+            "profile=\(filmProfile.logName) format=\(format.label) output=\(outputKind.logName) source=\(sourceDimensions) crop=\(cropDimensions) outputDimensions=\(outputDimensions) resize=\(resizeDisposition)"
         )
 
         let properties = buildEXIF(from: photo, focalLength: focalLength, filmProfile: filmProfile)
 
         do {
             RuntimeLog.info("[Capture]", "saveStarted")
-            try await saveToLibrary(cgImage: outputCGImage, exif: properties)
+            try await saveToLibrary(
+                cgImage: outputCGImage,
+                exif: properties,
+                outputKind: outputKind
+            )
             await MainActor.run {
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
             }
@@ -1116,25 +1386,64 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         return fullProps
     }
 
-    private func saveToLibrary(cgImage: CGImage, exif: [String: Any]) async throws {
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(
-            data,
-            "public.jpeg" as CFString,
-            1,
-            nil
-        ) else {
+    private func correctDistortionIfNeeded(
+        _ image: CIImage,
+        photo: AVCapturePhoto,
+        focalLength: Int
+    ) -> CIImage {
+        guard focalLength == 15,
+              let calibrationData = photo.cameraCalibrationData,
+              let filter = CIFilter(name: "CICameraCalibrationLensCorrection"),
+              filter.inputKeys.contains(kCIInputImageKey) else {
+            return image
+        }
+
+        filter.setValue(image, forKey: kCIInputImageKey)
+        if filter.inputKeys.contains("inputAVCameraCalibrationData") {
+            filter.setValue(calibrationData, forKey: "inputAVCameraCalibrationData")
+        }
+
+        guard let corrected = filter.outputImage else { return image }
+        RuntimeLog.info("[PhotoProcessing]", "lensCorrectionApplied focal=15")
+        return corrected
+    }
+
+    private func saveToLibrary(
+        cgImage: CGImage,
+        exif: [String: Any],
+        outputKind: CaptureOutputKind
+    ) async throws {
+        guard let imageUTI = outputKind.imageUTI else {
             throw CameraError.saveFailed
         }
 
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data,
+            imageUTI as CFString,
+            1,
+            nil
+        ) else {
+            throw outputKind == .heif ? CameraError.heifUnsupported : CameraError.saveFailed
+        }
+
         var destinationProperties = exif
-        destinationProperties[kCGImageDestinationLossyCompressionQuality as String] = Self.outputJPEGQuality
+        destinationProperties[kCGImageDestinationLossyCompressionQuality as String] =
+            outputKind == .heif ? Self.outputHEIFQuality : Self.outputJPEGQuality
         CGImageDestinationAddImage(destination, cgImage, destinationProperties as CFDictionary)
         guard CGImageDestinationFinalize(destination) else {
             throw CameraError.saveFailed
         }
 
         let finalData = data as Data
+        try await savePhotoDataToLibrary(finalData)
+        RuntimeLog.info(
+            "[PhotoProcessing]",
+            "encoded output=\(outputKind.logName) bytes=\(finalData.count) quality=\(Self.format(outputKind == .heif ? Self.outputHEIFQuality : Self.outputJPEGQuality))"
+        )
+    }
+
+    private func savePhotoDataToLibrary(_ finalData: Data) async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             PHPhotoLibrary.shared().performChanges {
                 let request = PHAssetCreationRequest.forAsset()
@@ -1151,8 +1460,19 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private enum CameraError: LocalizedError {
         case saveFailed
+        case dngUnsupported
+        case heifUnsupported
 
-        var errorDescription: String? { "Could not save photo to library" }
+        var errorDescription: String? {
+            switch self {
+            case .saveFailed:
+                return "Could not save photo to library"
+            case .dngUnsupported:
+                return "DNG capture is not supported on this device"
+            case .heifUnsupported:
+                return "HEIF encoding is not available on this device"
+            }
+        }
     }
 
     // MARK: - Device selection
@@ -1165,6 +1485,14 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         let fallbackReason: String?
     }
 
+    private struct ZoomCalibration {
+        let zoomFactor: CGFloat
+        let baseEquivalentFocalLength: CGFloat
+        let actualEquivalentFocalLength: CGFloat
+        let errorRatio: CGFloat
+        let wasClamped: Bool
+    }
+
     private func deviceSelection(for mm: Int) -> FocalSelection? {
         deviceSelection(for: mm, source: "deviceSelection")
     }
@@ -1173,11 +1501,63 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         for mm: Int,
         source: String
     ) -> FocalSelection? {
-        guard let selection = rawDeviceSelection(for: mm) else { return nil }
+        let capabilities = refreshedCameraCapabilities(source: source)
+        guard let selection = rawDeviceSelection(for: mm, capabilities: capabilities) else { return nil }
         return validatedRearSelection(selection, requested: mm, source: source)
     }
 
-    private func rawDeviceSelection(for mm: Int) -> FocalSelection? {
+    private func refreshedCameraCapabilities(source: String) -> CameraCapabilities {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInUltraWideCamera, .builtInWideAngleCamera, .builtInTelephotoCamera],
+            mediaType: .video,
+            position: .back
+        )
+        let devices = discovery.devices
+
+        let ultraWide = devices.first { $0.deviceType == .builtInUltraWideCamera }
+        let wide = devices.first { $0.deviceType == .builtInWideAngleCamera }
+        let tele = devices.first { $0.deviceType == .builtInTelephotoCamera }
+
+        let capabilities = CameraCapabilities(
+            hasUltraWide: ultraWide != nil,
+            hasWide: wide != nil,
+            hasTelephoto: tele != nil,
+            telephoto35mmEquivalent: tele.map { equivalentFocalLength(for: $0) },
+            wide35mmEquivalent: wide.map { equivalentFocalLength(for: $0) } ?? 24,
+            ultraWide35mmEquivalent: ultraWide.map { equivalentFocalLength(for: $0) },
+            virtualSwitchFactors: wide?.virtualDeviceSwitchOverVideoZoomFactors.map {
+                CGFloat(truncating: $0)
+            } ?? []
+        )
+
+        cameraCapabilities = capabilities
+        publishSupportedFocalsIfNeeded(capabilities.supportedFocalLengths)
+        RuntimeLog.info(
+            "[Device]",
+            "capabilities source=\(source) uw=\(capabilities.hasUltraWide) wide=\(capabilities.hasWide) tele=\(capabilities.hasTelephoto) uwEq=\(Self.formatOptional(capabilities.ultraWide35mmEquivalent)) wideEq=\(Self.format(capabilities.wide35mmEquivalent)) teleEq=\(Self.formatOptional(capabilities.telephoto35mmEquivalent)) virtual=\(capabilities.virtualSwitchFactors.map(Self.format).joined(separator: ",")) focals=\(capabilities.supportedFocalLengths.map(String.init).joined(separator: ","))"
+        )
+        return capabilities
+    }
+
+    private func publishSupportedFocalsIfNeeded(_ focals: [Int]) {
+        let normalized = focals.isEmpty ? [15, 28, 43, 85] : focals
+        DispatchQueue.main.async {
+            if self.availableFocalLengths != normalized {
+                self.availableFocalLengths = normalized
+            }
+
+            if !normalized.contains(self.selectedFocalLength),
+               let fallback = normalized.first {
+                self.selectedFocalLength = fallback
+                self.sessionSelectedFocalLength = fallback
+            }
+        }
+    }
+
+    private func rawDeviceSelection(
+        for mm: Int,
+        capabilities: CameraCapabilities
+    ) -> FocalSelection? {
         let discovery = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.builtInUltraWideCamera, .builtInWideAngleCamera, .builtInTelephotoCamera],
             mediaType: .video,
@@ -1200,21 +1580,66 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         guard let wide = find(.builtInWideAngleCamera) else { return nil }
 
-        func equivalentFocalLength(_ camera: AVCaptureDevice) -> CGFloat {
-            let radians = CGFloat(camera.activeFormat.videoFieldOfView) * .pi / 180.0
-            let tangent = tan(radians / 2.0)
-            return tangent > 0 ? 21.6 / tangent : 24.0
+        func clampedZoom(
+            targetMM: Int,
+            baseEquivalent: CGFloat,
+            device: AVCaptureDevice
+        ) -> CGFloat {
+            let desired = CGFloat(targetMM) / max(baseEquivalent, 0.001)
+            return min(
+                max(desired, device.minAvailableVideoZoomFactor),
+                device.maxAvailableVideoZoomFactor
+            )
         }
 
-        let wideEquivalent = equivalentFocalLength(wide)
+        func virtualZoom(targetMM: Int, baseEquivalent: CGFloat) -> CGFloat? {
+            let targetZoom = CGFloat(targetMM) / max(baseEquivalent, 0.001)
+            return capabilities.virtualSwitchFactors.first {
+                abs($0 - targetZoom) / max(targetZoom, 0.001) < 0.015
+            }
+        }
+
+        func wideSelection(targetMM: Int, fallbackReason: String?) -> FocalSelection {
+            let baseEquivalent = Self.nominalWideEquivalent
+            if let zoom = virtualZoom(targetMM: targetMM, baseEquivalent: baseEquivalent) {
+                return FocalSelection(
+                    device: wide,
+                    zoomFactor: zoom,
+                    deviceLabel: "wideVirtual",
+                    isFallback: false,
+                    fallbackReason: nil
+                )
+            }
+
+            return FocalSelection(
+                device: wide,
+                zoomFactor: clampedZoom(targetMM: targetMM, baseEquivalent: baseEquivalent, device: wide),
+                deviceLabel: label(for: wide),
+                isFallback: fallbackReason != nil,
+                fallbackReason: fallbackReason
+            )
+        }
+
+        func teleBaseEquivalent() -> CGFloat {
+            guard let teleEquivalent = capabilities.telephoto35mmEquivalent else {
+                return Self.nominalTeleShortEquivalent
+            }
+            return teleEquivalent >= 100
+                ? Self.nominalTeleLongEquivalent
+                : Self.nominalTeleShortEquivalent
+        }
 
         switch mm {
-        case 21:
+        case 15:
             if let ultraWide = find(.builtInUltraWideCamera) {
-                let zoom = CGFloat(mm) / equivalentFocalLength(ultraWide)
+                let zoom = clampedZoom(
+                    targetMM: mm,
+                    baseEquivalent: Self.nominalUltraWideEquivalent,
+                    device: ultraWide
+                )
                 return FocalSelection(
                     device: ultraWide,
-                    zoomFactor: min(max(zoom, ultraWide.minAvailableVideoZoomFactor), ultraWide.maxAvailableVideoZoomFactor),
+                    zoomFactor: zoom,
                     deviceLabel: label(for: ultraWide),
                     isFallback: false,
                     fallbackReason: nil
@@ -1228,54 +1653,52 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                 fallbackReason: "ultraWideUnavailable"
             )
 
-        case 35:
-            let zoom = max(35.0 / wideEquivalent, 1.0)
-            return FocalSelection(
-                device: wide,
-                zoomFactor: min(zoom, wide.maxAvailableVideoZoomFactor),
-                deviceLabel: label(for: wide),
-                isFallback: false,
-                fallbackReason: nil
-            )
+        case 28:
+            return wideSelection(targetMM: mm, fallbackReason: nil)
 
-        case 50:
-            let zoom = max(50.0 / wideEquivalent, 1.0)
-            return FocalSelection(
-                device: wide,
-                zoomFactor: min(zoom, wide.maxAvailableVideoZoomFactor),
-                deviceLabel: label(for: wide),
-                isFallback: false,
-                fallbackReason: nil
-            )
+        case 43:
+            return wideSelection(targetMM: mm, fallbackReason: nil)
 
-        case 105:
-            if let tele = find(.builtInTelephotoCamera) {
-                let zoom = max(105.0 / equivalentFocalLength(tele), 1.0)
+        case 77:
+            if let tele = find(.builtInTelephotoCamera),
+               teleBaseEquivalent() == Self.nominalTeleShortEquivalent {
                 return FocalSelection(
                     device: tele,
-                    zoomFactor: min(zoom, tele.maxAvailableVideoZoomFactor),
+                    zoomFactor: clampedZoom(targetMM: mm, baseEquivalent: teleBaseEquivalent(), device: tele),
                     deviceLabel: label(for: tele),
                     isFallback: false,
                     fallbackReason: nil
                 )
             }
-            let zoom = max(105.0 / wideEquivalent, 1.0)
-            return FocalSelection(
-                device: wide,
-                zoomFactor: min(zoom, wide.maxAvailableVideoZoomFactor),
-                deviceLabel: label(for: wide),
-                isFallback: true,
-                fallbackReason: "teleUnavailable"
-            )
+            return wideSelection(targetMM: mm, fallbackReason: "77mmWideCrop")
+
+        case 85:
+            if let tele = find(.builtInTelephotoCamera),
+               teleBaseEquivalent() == Self.nominalTeleShortEquivalent {
+                return FocalSelection(
+                    device: tele,
+                    zoomFactor: clampedZoom(targetMM: mm, baseEquivalent: teleBaseEquivalent(), device: tele),
+                    deviceLabel: label(for: tele),
+                    isFallback: false,
+                    fallbackReason: nil
+                )
+            }
+            return wideSelection(targetMM: mm, fallbackReason: "85mmWideCrop")
+
+        case 120:
+            if let tele = find(.builtInTelephotoCamera) {
+                return FocalSelection(
+                    device: tele,
+                    zoomFactor: clampedZoom(targetMM: mm, baseEquivalent: teleBaseEquivalent(), device: tele),
+                    deviceLabel: label(for: tele),
+                    isFallback: false,
+                    fallbackReason: nil
+                )
+            }
+            return nil
 
         default:
-            return FocalSelection(
-                device: wide,
-                zoomFactor: 1.0,
-                deviceLabel: label(for: wide),
-                isFallback: true,
-                fallbackReason: "unsupportedFocalRequested"
-            )
+            return nil
         }
     }
 
@@ -1446,20 +1869,17 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             session.addInput(input)
             RuntimeLog.info("[Session]", "inputAdded device=\(selection.deviceLabel)")
 
-            let clampedZoom = min(
-                max(selection.zoomFactor, selection.device.minAvailableVideoZoomFactor),
-                selection.device.maxAvailableVideoZoomFactor
-            )
             try selection.device.lockForConfiguration()
-            if #available(iOS 16.0, *) {
-                configurePreferredPhotoFormatIfAvailableLocked(
+            let calibration: ZoomCalibration
+            do {
+                defer { selection.device.unlockForConfiguration() }
+                calibration = applyPreferredFormatAndZoomLocked(
                     for: selection.device,
+                    targetFocalLength: sessionSelectedFocalLength,
                     reason: source
                 )
             }
-            selection.device.videoZoomFactor = clampedZoom
-            selection.device.unlockForConfiguration()
-            digitalZoomFactor = clampedZoom
+            digitalZoomFactor = calibration.zoomFactor
 
             configurePreferredPhotoDimensions(for: selection.device, reason: source)
             session.commitConfiguration()
@@ -1489,18 +1909,14 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         guard let wide = discovery.devices.first else { return nil }
 
-        let wideEquivalent = equivalentFocalLength(for: wide)
+        let wideEquivalent = Self.nominalWideEquivalent
         let desiredZoom: CGFloat
 
         switch mm {
-        case 35:
-            desiredZoom = max(35.0 / wideEquivalent, 1.0)
-        case 50:
-            desiredZoom = max(50.0 / wideEquivalent, 1.0)
-        case 105:
-            desiredZoom = max(105.0 / wideEquivalent, 1.0)
+        case 15, 28, 43, 77, 85, 120:
+            desiredZoom = max(CGFloat(mm) / wideEquivalent, 1.0)
         default:
-            desiredZoom = 1.0
+            desiredZoom = max(28.0 / wideEquivalent, 1.0)
         }
 
         let zoom = min(max(desiredZoom, wide.minAvailableVideoZoomFactor), wide.maxAvailableVideoZoomFactor)
@@ -1516,7 +1932,237 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     private func equivalentFocalLength(for camera: AVCaptureDevice) -> CGFloat {
         let radians = CGFloat(camera.activeFormat.videoFieldOfView) * .pi / 180.0
         let tangent = tan(radians / 2.0)
-        return tangent > 0 ? 21.6 / tangent : 24.0
+        guard tangent > 0 else { return 24.0 }
+
+        // AVCaptureDevice.Format does not expose physical focal length in the
+        // current public SDK, so the active format's FOV is the calibration source.
+        return 21.635 / tangent
+    }
+
+    @discardableResult
+    private func applyPreferredFormatAndZoomLocked(
+        for device: AVCaptureDevice,
+        targetFocalLength mm: Int,
+        reason: String
+    ) -> ZoomCalibration {
+        if #available(iOS 16.0, *) {
+            configurePreferredPhotoFormatIfAvailableLocked(
+                for: device,
+                reason: reason
+            )
+        }
+
+        let calibration = calibratedZoom(
+            for: device,
+            targetFocalLength: mm
+        )
+        device.videoZoomFactor = calibration.zoomFactor
+        applyMeteringModeLocked(to: device, mode: sessionMeteringMode)
+        let effectiveAELock = applyExposureLockLocked(
+            to: device,
+            locked: sessionAELocked
+        )
+        if effectiveAELock != sessionAELocked {
+            sessionAELocked = effectiveAELock
+            DispatchQueue.main.async {
+                self.isAELocked = effectiveAELock
+            }
+        }
+        logFocalCalibration(
+            calibration,
+            device: device,
+            reason: reason
+        )
+        return calibration
+    }
+
+    @discardableResult
+    private func applyExposureLockLocked(
+        to device: AVCaptureDevice,
+        locked: Bool
+    ) -> Bool {
+        if locked, device.isExposureModeSupported(.locked) {
+            device.exposureMode = .locked
+            return true
+        }
+
+        if device.isExposureModeSupported(.continuousAutoExposure) {
+            device.exposureMode = .continuousAutoExposure
+        } else if device.isExposureModeSupported(.autoExpose) {
+            device.exposureMode = .autoExpose
+        }
+        return false
+    }
+
+    private func applyMeteringModeLocked(
+        to device: AVCaptureDevice,
+        mode: MeteringMode
+    ) {
+        let point: CGPoint?
+        switch mode {
+        case .matrix:
+            point = nil
+        case .average:
+            point = nil
+        case .highlight:
+            point = nil
+        case .centerWeighted:
+            point = CGPoint(x: 0.5, y: 0.5)
+        }
+
+        if let point, device.isExposurePointOfInterestSupported {
+            device.exposurePointOfInterest = point
+        }
+
+        if !sessionAELocked {
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            } else if device.isExposureModeSupported(.autoExpose) {
+                device.exposureMode = .autoExpose
+            }
+        }
+
+        if mode == .centerWeighted {
+            applyExposureBiasLocked(0, to: device, force: true)
+        } else if mode == .highlight {
+            applyExposureBiasLocked(-0.25, to: device, force: true)
+        }
+
+        RuntimeLog.info(
+            "[Exposure]",
+            "meteringApplied mode=\(mode.logName) point=\(point.map { "\(Self.format($0.x)),\(Self.format($0.y))" } ?? "auto") aeLocked=\(sessionAELocked)"
+        )
+    }
+
+    nonisolated private func updateAdaptiveMeteringBiasIfNeeded(
+        buckets: [Int],
+        now: TimeInterval
+    ) {
+        let mode = sessionMeteringMode
+        guard mode == .matrix || mode == .average || mode == .highlight else { return }
+        guard !sessionAELocked else { return }
+        guard now - lastMeteringBiasUpdateAt >= 0.45 else { return }
+        lastMeteringBiasUpdateAt = now
+
+        let total = max(1, buckets.reduce(0, +))
+        let bucketCount = max(1, buckets.count)
+        var weightedSum: CGFloat = 0
+        var shadowCount = 0
+        var highlightCount = 0
+
+        for (index, count) in buckets.enumerated() {
+            let center = (CGFloat(index) + 0.5) / CGFloat(bucketCount)
+            weightedSum += center * CGFloat(count)
+            if center < 0.18 { shadowCount += count }
+            if center > 0.82 { highlightCount += count }
+        }
+
+        let mean = weightedSum / CGFloat(total)
+        let shadowShare = CGFloat(shadowCount) / CGFloat(total)
+        let highlightShare = CGFloat(highlightCount) / CGFloat(total)
+
+        let desiredBias: Float
+        switch mode {
+        case .average:
+            desiredBias = Float((0.46 - mean) * 1.15).clamped(to: -0.65...0.65)
+        case .matrix:
+            let base = (0.48 - mean) * 0.85
+            let highlightProtection = max(0, highlightShare - 0.12) * 0.95
+            let shadowRecovery = max(0, shadowShare - 0.24) * 0.32
+            desiredBias = Float(base - highlightProtection + shadowRecovery).clamped(to: -0.80...0.70)
+        case .highlight:
+            let highlightProtection = max(0, highlightShare - 0.05) * 1.65
+            let brightMeanControl = max(0, mean - 0.42) * 0.75
+            let shadowRecovery = max(0, shadowShare - 0.42) * 0.12
+            desiredBias = Float(-highlightProtection - brightMeanControl + shadowRecovery).clamped(to: -1.20...0.10)
+        case .centerWeighted:
+            desiredBias = 0
+        }
+
+        guard abs(desiredBias - sessionMeteringBias) > 0.08 else { return }
+
+        sessionQueue.async {
+            guard let device = self.currentDevice,
+                  !self.sessionAELocked,
+                  self.sessionMeteringMode == mode else {
+                return
+            }
+
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                self.applyExposureBiasLocked(desiredBias, to: device, force: false)
+            } catch {
+                RuntimeLog.error("[Error]", "adaptiveMeteringBiasFailed error=\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func applyExposureBiasLocked(
+        _ bias: Float,
+        to device: AVCaptureDevice,
+        force: Bool
+    ) {
+        let clampedBias = bias.clamped(
+            to: device.minExposureTargetBias...device.maxExposureTargetBias
+        )
+        guard force || abs(clampedBias - sessionMeteringBias) > 0.04 else { return }
+        device.setExposureTargetBias(clampedBias)
+        sessionMeteringBias = clampedBias
+        RuntimeLog.info("[Exposure]", "targetBias=\(Self.format(CGFloat(clampedBias)))")
+    }
+
+    private func calibratedZoom(
+        for device: AVCaptureDevice,
+        targetFocalLength mm: Int
+    ) -> ZoomCalibration {
+        let baseEquivalent = max(nominalEquivalentFocalLength(for: device), 0.001)
+        let requested = max(CGFloat(mm), 1.0)
+        let desiredZoom = requested / baseEquivalent
+        let zoom = min(
+            max(desiredZoom, device.minAvailableVideoZoomFactor),
+            device.maxAvailableVideoZoomFactor
+        )
+        let actualEquivalent = baseEquivalent * zoom
+        let errorRatio = abs(actualEquivalent - requested) / requested
+
+        return ZoomCalibration(
+            zoomFactor: zoom,
+            baseEquivalentFocalLength: baseEquivalent,
+            actualEquivalentFocalLength: actualEquivalent,
+            errorRatio: errorRatio,
+            wasClamped: abs(zoom - desiredZoom) > 0.001
+        )
+    }
+
+    private func nominalEquivalentFocalLength(for device: AVCaptureDevice) -> CGFloat {
+        switch device.deviceType {
+        case .builtInUltraWideCamera:
+            return Self.nominalUltraWideEquivalent
+        case .builtInWideAngleCamera:
+            return Self.nominalWideEquivalent
+        case .builtInTelephotoCamera:
+            let measured = cameraCapabilities.telephoto35mmEquivalent ?? equivalentFocalLength(for: device)
+            return measured >= 100
+                ? Self.nominalTeleLongEquivalent
+                : Self.nominalTeleShortEquivalent
+        default:
+            return Self.nominalWideEquivalent
+        }
+    }
+
+    private func logFocalCalibration(
+        _ calibration: ZoomCalibration,
+        device: AVCaptureDevice,
+        reason: String
+    ) {
+        let message = "reason=\(reason) device=\(deviceLogName(for: device)) base=\(Self.format(calibration.baseEquivalentFocalLength)) actual=\(Self.format(calibration.actualEquivalentFocalLength)) zoom=\(Self.format(calibration.zoomFactor)) error=\(Self.format(calibration.errorRatio * 100))% clamped=\(calibration.wasClamped)"
+
+        if calibration.errorRatio > 0.05 {
+            RuntimeLog.error("[FocalCalibration]", "targetMismatch \(message)")
+        } else {
+            RuntimeLog.info("[FocalCalibration]", message)
+        }
     }
 
     private func deviceLogName(for device: AVCaptureDevice) -> String {
@@ -1571,7 +2217,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             )
             return
         }
-
+        
         let previous = currentDimensions.map(Self.photoDimensionsLogName) ?? "unknown"
         device.activeFormat = candidate
         RuntimeLog.info(
@@ -1694,56 +2340,90 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     private static func detailProcessingPlan(
         profile: FilmProfile,
         focalLength: Int,
+        digitalZoomFactor: CGFloat,
         iso: CGFloat
     ) -> DetailProcessingPlan {
         let focalBase: Float
         switch focalLength {
-        case 21:  focalBase = 0.11
-        case 35:  focalBase = 0.14
-        case 50:  focalBase = 0.17
-        case 105: focalBase = 0.20
-        default:  focalBase = 0.15
+        case 15:  focalBase = 0.10
+        case 28:  focalBase = 0.12
+        case 43:  focalBase = 0.15
+        case 77:  focalBase = 0.17
+        case 85:  focalBase = 0.17
+        case 120: focalBase = 0.19
+        default:  focalBase = 0.14
         }
 
+        let isLongFocal = focalLength >= 77
         let profileMultiplier: Float
-        let radius: Float
+        let baseRadius: Float
         switch profile {
         case .raw:
             profileMultiplier = 1.00
-            radius = focalLength == 105 ? 1.00 : 1.30
+            baseRadius = isLongFocal ? 0.96 : 1.26
         case .vg:
-            profileMultiplier = focalLength == 105 ? 0.82 : 0.88
-            radius = focalLength == 105 ? 0.82 : 1.15
+            profileMultiplier = isLongFocal ? 0.50 : 0.62
+            baseRadius = isLongFocal ? 0.54 : 0.82
         case .ew:
-            profileMultiplier = focalLength == 105 ? 0.62 : 0.42
-            radius = focalLength == 105 ? 0.72 : 0.65
+            profileMultiplier = isLongFocal ? 0.30 : 0.30
+            baseRadius = isLongFocal ? 0.48 : 0.52
+        }
+
+        let zoomDenoiseBoost: Float
+        let radiusScale: Float
+        let sharpenScale: Float
+        if digitalZoomFactor > 2.0 {
+            zoomDenoiseBoost = 0.020
+            radiusScale = 0.70
+            sharpenScale = 0.82
+        } else if digitalZoomFactor > 1.5 {
+            zoomDenoiseBoost = 0.010
+            radiusScale = 0.85
+            sharpenScale = 0.90
+        } else {
+            zoomDenoiseBoost = 0
+            radiusScale = 1.0
+            sharpenScale = 1.0
         }
 
         let isoAttenuation = Float(max(0.35, 1.0 - max(0.0, Double(iso) - 160.0) / 1000.0))
-        let sharpenIntensity = focalBase * profileMultiplier * isoAttenuation
+        let sharpenIntensity = focalBase * profileMultiplier * isoAttenuation * sharpenScale
+        let radius = baseRadius * radiusScale
 
         let denoiseThreshold: CGFloat
         switch profile {
         case .raw: denoiseThreshold = 280
-        case .vg: denoiseThreshold = 220
-        case .ew: denoiseThreshold = 1000
+        case .vg: denoiseThreshold = 180
+        case .ew: denoiseThreshold = 640
         }
 
-        let shouldDenoise = iso > denoiseThreshold
+        let shouldDenoise = iso > denoiseThreshold || zoomDenoiseBoost > 0
         let noiseLevel: Float
         if shouldDenoise {
             let base: Float = {
                 switch profile {
-                case .ew: return 0.003
-                case .raw, .vg: return 0.008
+                case .ew: return 0.004
+                case .vg: return 0.006
+                case .raw: return 0.008
                 }
             }()
-            let extraLimit: Float = profile == .ew ? 0.016 : 0.030
-            let extraDivisor: Float = profile == .ew ? 42_000.0 : 28_000.0
+            let extraLimit: Float = profile == .ew ? 0.018 : (profile == .vg ? 0.024 : 0.030)
+            let extraDivisor: Float = profile == .ew ? 36_000.0 : (profile == .vg ? 34_000.0 : 28_000.0)
             let extra = min(extraLimit, max(0.0, Float(iso - denoiseThreshold) / extraDivisor))
-            noiseLevel = base + extra
+            noiseLevel = base + extra + zoomDenoiseBoost
         } else {
             noiseLevel = 0
+        }
+
+        let reason: String
+        if iso > denoiseThreshold && zoomDenoiseBoost > 0 {
+            reason = "isoAndZoomAdaptive"
+        } else if zoomDenoiseBoost > 0 {
+            reason = "zoomAdaptive"
+        } else if shouldDenoise {
+            reason = "isoAdaptive"
+        } else {
+            reason = "lowISO"
         }
 
         return DetailProcessingPlan(
@@ -1751,35 +2431,40 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             sharpenRadius: radius,
             noiseLevel: noiseLevel,
             shouldDenoise: shouldDenoise,
-            reason: shouldDenoise ? "isoAdaptive" : "lowISO"
+            reason: reason
         )
     }
 
-    private static func doubleValue(_ value: Any?) -> Double? {
+    nonisolated private static func doubleValue(_ value: Any?) -> Double? {
         if let number = value as? NSNumber { return number.doubleValue }
         if let double = value as? Double { return double }
         if let string = value as? String { return Double(string) }
         return nil
     }
 
-    private static func intValue(_ value: Any?) -> Int? {
+    nonisolated private static func intValue(_ value: Any?) -> Int? {
         if let number = value as? NSNumber { return number.intValue }
         if let int = value as? Int { return int }
         if let string = value as? String { return Int(string) }
         return nil
     }
 
-    private static func formatOptional(_ value: Double?) -> String {
+    nonisolated private static func formatOptional(_ value: Double?) -> String {
         guard let value else { return "unknown" }
         return String(format: "%.3f", value)
     }
 
-    private static func formatExposure(_ value: Double?) -> String {
+    nonisolated private static func formatOptional(_ value: CGFloat?) -> String {
+        guard let value else { return "unknown" }
+        return format(value)
+    }
+
+    nonisolated private static func formatExposure(_ value: Double?) -> String {
         guard let value else { return "unknown" }
         return String(format: "%.5fs", value)
     }
 
-    private static func whiteBalanceLogName(_ value: Int?) -> String {
+    nonisolated private static func whiteBalanceLogName(_ value: Int?) -> String {
         switch value {
         case 0: return "auto"
         case 1: return "manual"
@@ -1788,15 +2473,15 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
-    private static func now() -> TimeInterval {
+    nonisolated private static func now() -> TimeInterval {
         ProcessInfo.processInfo.systemUptime
     }
 
-    private static func format(_ value: CGFloat) -> String {
+    nonisolated private static func format(_ value: CGFloat) -> String {
         String(format: "%.2f", value)
     }
 
-    private static func formatDuration(_ duration: TimeInterval) -> String {
+    nonisolated private static func formatDuration(_ duration: TimeInterval) -> String {
         String(format: "%.3fs", duration)
     }
 }
@@ -1804,7 +2489,9 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate, @unchecked Sendable {
     let format: AspectFormat
     let filmProfile: FilmProfile
+    let outputKind: CaptureOutputKind
     let cropFactor: CGFloat
+    let digitalZoomFactor: CGFloat
     let focalLength: Int
     let captureStartedAt: TimeInterval
 
@@ -1814,7 +2501,9 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
     init(
         format: AspectFormat,
         filmProfile: FilmProfile,
+        outputKind: CaptureOutputKind,
         cropFactor: CGFloat,
+        digitalZoomFactor: CGFloat,
         focalLength: Int,
         captureStartedAt: TimeInterval,
         cameraManager: CameraManager,
@@ -1822,7 +2511,9 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
     ) {
         self.format = format
         self.filmProfile = filmProfile
+        self.outputKind = outputKind
         self.cropFactor = cropFactor
+        self.digitalZoomFactor = digitalZoomFactor
         self.focalLength = focalLength
         self.captureStartedAt = captureStartedAt
         self.cameraManager = cameraManager
@@ -1854,7 +2545,9 @@ private final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegat
                     photo,
                     format: self.format,
                     filmProfile: self.filmProfile,
+                    outputKind: self.outputKind,
                     cropFactor: self.cropFactor,
+                    digitalZoomFactor: self.digitalZoomFactor,
                     focalLength: self.focalLength,
                     captureStartedAt: self.captureStartedAt
                 )

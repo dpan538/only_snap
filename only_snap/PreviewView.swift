@@ -39,7 +39,7 @@ final class FilmPreviewUIView: UIView {
     private struct RenderState: Sendable {
         var profile: FilmProfile = .raw
         var pendingProfile: FilmProfile?
-        var focalLength = 35
+        var focalLength = 28
         var orientation: CameraOrientationState = .portrait
         var format: AspectFormat = .threeToFour
         var generation = 0
@@ -114,7 +114,7 @@ final class FilmPreviewUIView: UIView {
 
     private var desiredProfile: FilmProfile = .raw
     private var desiredPendingProfile: FilmProfile?
-    private var desiredFocalLength = 35
+    private var desiredFocalLength = 28
     private var desiredOrientation: CameraOrientationState = .portrait
     private var desiredFormat: AspectFormat = .threeToFour
     private var desiredPreviewGeneration = 0
@@ -389,6 +389,7 @@ extension FilmPreviewUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
 
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
             guard let metalLayer = inputs.metalLayer else { return }
+            renderCameraManager?.updatePreviewHistogram(from: pixelBuffer)
 
             if shouldDropStaleFrame(sampleBuffer: sampleBuffer, connection: connection, state: state) {
                 return
@@ -403,7 +404,8 @@ extension FilmPreviewUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
             let processedImage = FilmProfileProcessor.apply(
                 profile: state.profile,
                 to: inputImage,
-                focalLength: state.focalLength
+                focalLength: state.focalLength,
+                isPreview: true
             )
             let (filteredImage, transformDescription) = orientedPreviewImage(
                 processedImage,

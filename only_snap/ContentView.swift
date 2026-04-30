@@ -1,13 +1,67 @@
 import SwiftUI
+import Combine
+import CoreMotion
 
 private typealias L = Theme.Layout
+
+private enum HistogramDisplayMode: Equatable {
+    case waveform
+    case bars
+
+    var next: HistogramDisplayMode {
+        switch self {
+        case .waveform: return .bars
+        case .bars: return .waveform
+        }
+    }
+}
+
+private enum GridGuideMode: Equatable {
+    case off
+    case thirds
+    case golden
+
+    var next: GridGuideMode {
+        switch self {
+        case .off: return .thirds
+        case .thirds: return .golden
+        case .golden: return .off
+        }
+    }
+
+    var isActive: Bool {
+        self != .off
+    }
+
+    var label: String {
+        switch self {
+        case .off, .thirds: return "GRID"
+        case .golden: return "GOLD"
+        }
+    }
+}
+
+private struct PortraitLayoutMetrics {
+    let centerX: CGFloat
+    let contentWidth: CGFloat
+    let viewfinderWidth: CGFloat
+    let viewfinderHeight: CGFloat
+    let topHUDCenterY: CGFloat
+    let viewfinderCenterY: CGFloat
+    let focalCenterY: CGFloat
+    let controlsCenterY: CGFloat
+    let controlsHeight: CGFloat
+}
 
 struct ContentView: View {
 
     @EnvironmentObject private var camera: CameraManager
     @State private var shutterProgress: CGFloat = 0
+    @State private var histogramMode: HistogramDisplayMode = .waveform
+    @State private var levelEnabled = false
+    @State private var gridMode: GridGuideMode = .off
+    @StateObject private var levelMotion = LevelMotionModel()
 
-    private let focals = [21, 35, 50, 105]
     private let haptic = UIImpactFeedbackGenerator(style: .rigid)
     private let orientationUIAnimation = Animation.linear(duration: 0.14)
     private let selectionAnimation = Animation.linear(duration: 0.12)
@@ -29,25 +83,41 @@ struct ContentView: View {
             let sw = screen.size.width
             let sh = screen.size.height
             let safe = screen.safeAreaInsets
+            let metrics = portraitLayoutMetrics(
+                screenWidth: sw,
+                screenHeight: sh,
+                safeTop: safe.top,
+                safeBottom: safe.bottom,
+                format: camera.selectedAspectFormat
+            )
 
             ZStack {
                 Theme.Colors.background.ignoresSafeArea()
 
-                VStack(spacing: 0) {
-                    viewfinderBlock(screenWidth: sw, screenHeight: sh, safeTop: safe.top)
-                    Spacer(minLength: 0)
-                    controlsBlock
-                }
-                .offset(y: -35)
+                viewfinderBlock(viewfinderWidth: metrics.viewfinderWidth)
+                    .position(x: metrics.centerX, y: metrics.viewfinderCenterY)
+
+                topHUD(width: metrics.viewfinderWidth)
+                    .position(x: metrics.centerX, y: metrics.topHUDCenterY)
+
+                focalRow
+                    .frame(width: metrics.viewfinderWidth, height: L.focalRowHeight)
+                    .position(x: metrics.centerX, y: metrics.focalCenterY)
+
+                controlsBlock(width: metrics.viewfinderWidth)
+                    .frame(width: metrics.viewfinderWidth, height: metrics.controlsHeight)
+                    .position(x: metrics.centerX, y: metrics.controlsCenterY)
             }
         }
         .ignoresSafeArea(edges: .bottom)
         .onAppear {
             UIDevice.current.beginGeneratingDeviceOrientationNotifications()
             camera.updateCameraOrientation(UIDevice.current.orientation)
+            levelMotion.start()
         }
         .onDisappear {
             UIDevice.current.endGeneratingDeviceOrientationNotifications()
+            levelMotion.stop()
             camera.stop()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
@@ -67,34 +137,166 @@ struct ContentView: View {
         )
     }
 
-    private func viewfinderBlock(
-        screenWidth sw: CGFloat,
-        screenHeight sh: CGFloat,
-        safeTop: CGFloat
-    ) -> some View {
-        let selectedFormat = camera.selectedAspectFormat
-        let vfWidth = max(1, sw - L.vfHPad * 2)
-        let maxH = vfWidth * AspectFormat.twoToThree.heightRatio
-        let containerH = maxH + L.vfTopOffset + 20
-        let vfHeight = max(1, vfWidth * selectedFormat.heightRatio)
+    private func portraitLayoutMetrics(
+        screenWidth: CGFloat,
+        screenHeight: CGFloat,
+        safeTop: CGFloat,
+        safeBottom: CGFloat,
+        format: AspectFormat
+    ) -> PortraitLayoutMetrics {
+        let maxContentWidth = max(1, screenWidth - L.vfHPad * 2)
+        let controlsHeight = max(L.shutterHitSize, L.btnSize * 2 + L.sideButtonSpacing)
+        let controlsBottom = screenHeight - max(L.controlsBottomPad, safeBottom + L.controlsSafeBottomInset)
+        let controlsCenterY = controlsBottom - controlsHeight / 2
 
-        let twoRowsH: CGFloat = L.btnSize * 2 + 18
-        let focalRowH: CGFloat = 44
-        let controlsH: CGFloat = (L.controlsBottomPad + L.controlsExtraDown)
-            + twoRowsH + L.focalToButtons + focalRowH
-        let focalRowTop = sh - controlsH + 35
-        let islandBottom = safeTop
-        let availableH = focalRowTop - islandBottom
-        let squareCentreY = islandBottom + availableH / 2
-        let containerTopInScreen = islandBottom - 35
-        let squareOffsetY = squareCentreY - (containerTopInScreen + containerH / 2)
+        // Focal labels are not part of the lower control cluster; keep them
+        // anchored to the previous control baseline while the buttons move.
+        let focalReferenceHeight = max(L.shutterHitSize, L.focalReferenceButtonSize * 2 + L.sideButtonSpacing)
+        let focalReferenceBottom = screenHeight - max(
+            L.focalReferenceControlsBottomPad,
+            safeBottom + L.focalReferenceControlsSafeBottomInset
+        )
+        let focalReferenceTop = focalReferenceBottom - focalReferenceHeight
+        let focalCenterY = focalReferenceTop - L.focalToButtons - L.focalRowHeight / 2
+        let focalTop = focalCenterY - L.focalRowHeight / 2
 
-        let vOffset: CGFloat = {
-            switch selectedFormat {
-            case .square: return squareOffsetY
-            default:      return selectedFormat.verticalOffset(forWidth: vfWidth)
+        let minTopHUDTop: CGFloat = 10
+        let topHUDTop = max(minTopHUDTop, safeTop - L.topHUDTopLift)
+        let viewfinderMinTop = topHUDTop + L.topHUDHeight + L.topHUDToViewfinder
+        let viewfinderMaxBottom = focalTop - L.viewfinderToFocal
+        let availableViewfinderHeight = max(1, viewfinderMaxBottom - viewfinderMinTop)
+
+        // Keep 3:3, 3:4, and 3:4.5 on one shared width. The tallest
+        // portrait ratio decides the maximum width, so only height changes.
+        let tallestPortraitRatio = AspectFormat.twoToThree.heightRatio
+        let targetViewfinderWidth = min(maxContentWidth, L.viewfinderTargetWidth)
+        let viewfinderWidth = min(targetViewfinderWidth, availableViewfinderHeight / tallestPortraitRatio)
+        let viewfinderHeight = viewfinderWidth * format.heightRatio
+        let viewfinderCenterY = viewfinderMinTop + availableViewfinderHeight / 2
+
+        return PortraitLayoutMetrics(
+            centerX: screenWidth / 2,
+            contentWidth: viewfinderWidth,
+            viewfinderWidth: viewfinderWidth,
+            viewfinderHeight: viewfinderHeight,
+            topHUDCenterY: topHUDTop + L.topHUDHeight / 2,
+            viewfinderCenterY: viewfinderCenterY,
+            focalCenterY: focalCenterY,
+            controlsCenterY: controlsCenterY,
+            controlsHeight: controlsHeight
+        )
+    }
+
+    private func topHUD(width: CGFloat) -> some View {
+        let stripWidth = max(0, width - L.histogramWidth - L.topHUDSpacing)
+
+        return HStack(alignment: .top, spacing: L.topHUDSpacing) {
+            Button {
+                haptic.impactOccurred()
+                histogramMode = histogramMode.next
+            } label: {
+                MiniHistogramView(
+                    mode: histogramMode,
+                    samples: camera.histogramSamples
+                )
+                    .frame(width: L.histogramWidth, height: L.topHUDHeight)
             }
-        }()
+            .buttonStyle(.plain)
+
+            proControlStrip
+                .frame(width: stripWidth, alignment: .leading)
+        }
+        .frame(width: width, height: L.topHUDHeight, alignment: .leading)
+        .clipped()
+        .animation(selectionAnimation, value: histogramMode)
+        .animation(selectionAnimation, value: camera.captureOutputKind)
+        .animation(selectionAnimation, value: camera.isAELocked)
+        .animation(selectionAnimation, value: camera.meteringMode)
+        .animation(selectionAnimation, value: gridMode)
+    }
+
+    private var proControlStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                proCapsule(title: camera.captureOutputKind.rawValue, width: 58) {
+                    haptic.impactOccurred()
+                    camera.cycleCaptureOutputKind()
+                }
+
+                proCapsule(
+                    title: "AE",
+                    systemName: camera.isAELocked ? "lock.fill" : "lock.open",
+                    isActive: camera.isAELocked,
+                    width: 60
+                ) {
+                    haptic.impactOccurred()
+                    camera.toggleAELock()
+                }
+
+                proCapsule(title: "LEVEL", isActive: levelEnabled, width: 74) {
+                    haptic.impactOccurred()
+                    levelEnabled.toggle()
+                }
+
+                proCapsule(title: gridMode.label, isActive: gridMode.isActive, width: 64) {
+                    haptic.impactOccurred()
+                    gridMode = gridMode.next
+                }
+
+                proCapsule(
+                    title: camera.meteringMode.shortLabel,
+                    systemName: camera.meteringMode.systemImageName,
+                    isActive: camera.meteringMode != .matrix,
+                    width: camera.meteringMode == .matrix ? 88 : 92
+                ) {
+                    haptic.impactOccurred()
+                    camera.cycleMeteringMode()
+                }
+            }
+        }
+        .frame(height: L.proCapsuleHitHeight)
+    }
+
+    private func proCapsule(
+        title: String,
+        systemName: String? = nil,
+        isActive: Bool = false,
+        width: CGFloat,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            ZStack {
+                HStack(spacing: 5) {
+                    if !title.isEmpty {
+                        Text(title)
+                            .font(.system(size: 12, weight: .semibold))
+                            .kerning(0.6)
+                    }
+
+                    if let systemName {
+                        Image(systemName: systemName)
+                            .font(.system(size: title.isEmpty ? 15 : 11, weight: .semibold))
+                    }
+                }
+                .rotationEffect(iconRotation)
+            }
+            .foregroundColor(isActive ? Theme.Colors.cream : Theme.Colors.bodyDark)
+            .frame(width: width, height: L.proCapsuleHeight)
+            .background(proCapsuleShape.fill(isActive ? Theme.Colors.bodyDark : Theme.Colors.buttonFill.opacity(0.92)))
+            .overlay(proCapsuleShape.strokeBorder(Theme.Colors.bodyDark.opacity(isActive ? 1.0 : 0.58), lineWidth: 1.2))
+            .frame(width: width, height: L.proCapsuleHitHeight)
+            .contentShape(proCapsuleShape)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var proCapsuleShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: L.proCapsuleCornerRadius, style: .continuous)
+    }
+
+    private func viewfinderBlock(viewfinderWidth vfWidth: CGFloat) -> some View {
+        let selectedFormat = camera.selectedAspectFormat
+        let vfHeight = max(1, vfWidth * selectedFormat.heightRatio)
 
         return ZStack {
             RoundedRectangle(cornerRadius: 14)
@@ -123,6 +325,14 @@ struct ContentView: View {
                 )
                 .overlay(
                     ZStack {
+                        if gridMode.isActive {
+                            GridGuideView(mode: gridMode)
+                        }
+
+                        if levelEnabled {
+                            LevelGuideView(rollDegrees: levelMotion.rollDegrees)
+                        }
+
                         ViewfinderCorners()
                         CrosshairView()
                     }
@@ -142,49 +352,43 @@ struct ContentView: View {
                         }
                     }
                 )
+                .contentShape(RoundedRectangle(cornerRadius: 10))
         }
-        .offset(y: vOffset)
         .animation(aspectAnimation, value: selectedFormat)
-        .frame(width: sw, height: containerH)
-        .padding(.top, L.vfTopOffset)
+        .frame(width: vfWidth, height: vfHeight, alignment: .center)
     }
 
-    private var controlsBlock: some View {
-        VStack(spacing: 0) {
-            focalRow
-                .padding(.bottom, L.focalToButtons + 10)
-                .offset(y: -10)
-
-            ZStack(alignment: .center) {
-                shutterButton
-                HStack(alignment: .bottom, spacing: 0) {
-                    leftButtons
-                    Spacer()
-                    rightButtons
-                }
-            }
-            .offset(y: -20)
-            .padding(.horizontal, L.vfHPad)
+    private func controlsBlock(width: CGFloat) -> some View {
+        return ZStack(alignment: .center) {
+            shutterButton
+            leftButtons
+                .frame(width: width, alignment: .leading)
+                .offset(x: -(L.btnHitSize - L.btnSize) / 2)
+            rightButtons
+                .frame(width: width, alignment: .trailing)
+                .offset(x: (L.btnHitSize - L.aspectButtonWidth) / 2)
         }
-        .padding(.bottom, L.controlsBottomPad + L.controlsExtraDown)
+        .frame(width: width)
         .animation(orientationUIAnimation, value: camera.cameraOrientation)
     }
 
     private var focalRow: some View {
-        HStack(alignment: .lastTextBaseline, spacing: 14) {
+        let focals = camera.availableFocalLengths.isEmpty ? [15, 28, 43, 85] : camera.availableFocalLengths
+
+        return HStack(alignment: .lastTextBaseline, spacing: 12) {
             ForEach(focals, id: \.self) { mm in
                 Button { switchFocal(to: mm) } label: {
                     let isSelected = mm == camera.selectedFocalLength
                     HStack(alignment: .lastTextBaseline, spacing: 2) {
                         Text("\(mm)")
-                            .font(.system(size: isSelected ? 36 : 20, weight: isSelected ? .medium : .regular))
+                            .font(.system(size: isSelected ? 33.3 : 21, weight: isSelected ? .medium : .regular))
                             .foregroundColor(isSelected ? Theme.Colors.bodyDark : Theme.Colors.textMuted)
                         Text("mm")
-                            .font(.system(size: 15, weight: .regular))
+                            .font(.system(size: 13.5, weight: .regular))
                             .foregroundColor(Theme.Colors.textSubtle)
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
-                            .frame(width: isSelected ? 30 : 0, alignment: .leading)
+                            .frame(width: isSelected ? 29 : 0, alignment: .leading)
                             .clipped()
                             .opacity(isSelected ? 1 : 0)
                     }
@@ -200,7 +404,7 @@ struct ContentView: View {
     }
 
     private var leftButtons: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: L.sideButtonSpacing) {
             Button {
                 let next = !camera.flashEnabled
                 camera.setFlashEnabled(next)
@@ -211,10 +415,12 @@ struct ContentView: View {
                     .overlay(Circle().strokeBorder(Theme.Colors.buttonBorder, lineWidth: 1))
                     .overlay(
                         Image(systemName: camera.flashEnabled ? "bolt.fill" : "bolt.slash.fill")
-                            .font(.system(size: 26, weight: .medium))
+                            .font(.system(size: 27.5, weight: .medium))
                             .foregroundColor(camera.flashEnabled ? Theme.Colors.bodyDark : Theme.Colors.textMuted)
                             .rotationEffect(iconRotation)
                     )
+                    .frame(width: L.btnHitSize, height: L.btnHitSize)
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
 
@@ -225,7 +431,6 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
         }
-        .offset(y: -15)
         .animation(selectionAnimation, value: camera.flashEnabled)
         .animation(selectionAnimation, value: camera.activeFilmProfile)
         .animation(selectionAnimation, value: camera.pendingFilmProfile)
@@ -241,8 +446,8 @@ struct ContentView: View {
                 .fill(Theme.Colors.rawFill)
                 .frame(width: L.btnSize, height: L.btnSize)
                 .overlay(
-                    Text("raw")
-                        .font(.system(size: 19, weight: .medium))
+                    Text(FilmProfile.raw.label)
+                        .font(.system(size: 21, weight: .medium))
                         .foregroundColor(Theme.Colors.cream)
                         .kerning(1.0)
                         .rotationEffect(iconRotation)
@@ -255,13 +460,15 @@ struct ContentView: View {
                 .overlay(Circle().strokeBorder(Theme.Colors.bodyDark, lineWidth: 2))
                 .overlay(
                     Text(filmProfileButtonTitle)
-                        .font(.system(size: isPendingProcessedProfile ? 18 : 21, weight: .medium))
+                        .font(.system(size: isPendingProcessedProfile ? 19 : 22, weight: .medium))
                         .foregroundColor(Theme.Colors.bodyDark)
                         .kerning(0.5)
                         .rotationEffect(iconRotation)
                 )
                 .opacity(showsProcessedProfile ? 1 : 0)
         }
+        .frame(width: L.btnHitSize, height: L.btnHitSize)
+        .contentShape(Circle())
         .animation(selectionAnimation, value: camera.activeFilmProfile)
         .animation(selectionAnimation, value: camera.pendingFilmProfile)
     }
@@ -280,11 +487,11 @@ struct ContentView: View {
             ZStack {
                 Circle()
                     .fill(Color.clear)
-                    .frame(width: L.shutterOuter, height: L.shutterOuter)
+                    .frame(width: L.shutterHitSize, height: L.shutterHitSize)
 
                 Circle()
                     .strokeBorder(Theme.Colors.bodyDark.opacity(0.25), lineWidth: 2.5)
-                    .frame(width: L.shutterOuter * 0.9, height: L.shutterOuter * 0.9)
+                    .frame(width: L.shutterOuter, height: L.shutterOuter)
 
                 Circle()
                     .trim(from: 0, to: shutterProgress)
@@ -292,46 +499,43 @@ struct ContentView: View {
                         Theme.Colors.bodyDark,
                         style: StrokeStyle(lineWidth: 2.5, lineCap: .round)
                     )
-                    .frame(width: L.shutterOuter * 0.9, height: L.shutterOuter * 0.9)
+                    .frame(width: L.shutterOuter, height: L.shutterOuter)
                     .rotationEffect(.degrees(-90))
 
                 Circle()
                     .fill(Theme.Colors.bodyDark)
-                    .frame(width: L.shutterInner * 0.9, height: L.shutterInner * 0.9)
+                    .frame(width: L.shutterInner, height: L.shutterInner)
             }
+            .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .offset(y: -15)
     }
 
     private var rightButtons: some View {
-        VStack(spacing: 18) {
-            Color.clear.frame(width: L.btnSize, height: L.btnSize)
-
-            Button {
-                switchFormat(to: camera.selectedAspectFormat.next())
-            } label: {
-                Text(camera.selectedAspectFormat.label)
-                    .font(.system(size: 20, weight: .medium))
-                    .foregroundColor(Theme.Colors.bodyDark)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .strokeBorder(Theme.Colors.bodyDark, lineWidth: 1.5)
-                    )
-                    .rotationEffect(iconRotation)
-            }
-            .buttonStyle(.plain)
-            .offset(y: -L.formatUpLift)
-            .gesture(formatSwipeGesture)
+        Button {
+            switchFormat(to: camera.selectedAspectFormat.next())
+        } label: {
+            Text(camera.selectedAspectFormat.label)
+                .font(.system(size: 20, weight: .medium))
+                .foregroundColor(Theme.Colors.bodyDark)
+                .frame(width: L.aspectButtonWidth, height: L.aspectButtonHeight)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Theme.Colors.bodyDark, lineWidth: 1.5)
+                )
+                .rotationEffect(iconRotation)
         }
+        .buttonStyle(.plain)
+        .frame(width: L.btnHitSize, height: L.btnHitSize)
+        .contentShape(Rectangle())
+        .gesture(formatSwipeGesture)
         .animation(aspectAnimation, value: camera.selectedAspectFormat)
     }
 
     private var focalSwipeGesture: some Gesture {
         DragGesture(minimumDistance: 10)
             .onChanged { value in
+                let focals = camera.availableFocalLengths.isEmpty ? [15, 28, 43, 85] : camera.availableFocalLengths
                 let steps = Int((-value.translation.width) / L.swipeThreshold)
                 guard steps != 0 else { return }
                 let idx = focals.firstIndex(of: camera.selectedFocalLength) ?? 1
@@ -350,7 +554,7 @@ struct ContentView: View {
                 let dominant = abs(dx) > abs(dy) ? dx : -dy
                 let steps = Int(dominant / L.swipeThreshold)
                 guard steps != 0 else { return }
-                let all = AspectFormat.allCases
+                let all = AspectFormat.standardCases
                 let idx = all.firstIndex(of: camera.selectedAspectFormat) ?? 0
                 let newIdx = (idx + steps).clamped(to: 0...(all.count - 1))
                 if all[newIdx] != camera.selectedAspectFormat {
@@ -430,6 +634,223 @@ struct CrosshairView: View {
             Rectangle().fill(color).frame(width: size, height: lineWidth)
             Rectangle().fill(color).frame(width: lineWidth, height: size)
         }
+    }
+}
+
+@MainActor
+private final class LevelMotionModel: ObservableObject {
+    @Published var rollDegrees: Double = 0
+
+    private let motionManager = CMMotionManager()
+    private let motionQueue = OperationQueue()
+
+    func start() {
+        guard motionManager.isDeviceMotionAvailable else { return }
+        motionManager.deviceMotionUpdateInterval = 1.0 / 30.0
+        motionManager.startDeviceMotionUpdates(to: motionQueue) { [weak self] motion, _ in
+            guard let motion else { return }
+            let roll = Self.rollDegrees(from: motion.gravity)
+            Task { @MainActor in
+                self?.rollDegrees = roll
+            }
+        }
+    }
+
+    func stop() {
+        motionManager.stopDeviceMotionUpdates()
+    }
+
+    private static func rollDegrees(from gravity: CMAcceleration) -> Double {
+        let raw = atan2(gravity.x, -gravity.y) * 180.0 / Double.pi
+        let nearestRightAngle = (raw / 90.0).rounded() * 90.0
+        var normalized = raw - nearestRightAngle
+
+        if normalized > 45 {
+            normalized -= 90
+        } else if normalized < -45 {
+            normalized += 90
+        }
+
+        return normalized
+    }
+}
+
+private struct MiniHistogramView: View {
+    let mode: HistogramDisplayMode
+    let samples: [CGFloat]
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let height = geo.size.height
+            let inset: CGFloat = 6
+            let drawWidth = max(1, width - inset * 2)
+            let drawHeight = max(1, height - inset * 2)
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Theme.Colors.buttonFill.opacity(0.92))
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Theme.Colors.bodyDark.opacity(0.58), lineWidth: 1.2)
+
+                Path { path in
+                    path.move(to: CGPoint(x: inset, y: height * 0.33))
+                    path.addLine(to: CGPoint(x: width - inset, y: height * 0.33))
+                    path.move(to: CGPoint(x: inset, y: height * 0.66))
+                    path.addLine(to: CGPoint(x: width - inset, y: height * 0.66))
+                }
+                .stroke(Theme.Colors.bodyDark.opacity(0.12), lineWidth: 1)
+
+                if mode == .waveform {
+                    Path { path in
+                        for index in displayedSamples.indices {
+                            let progress = CGFloat(index) / CGFloat(max(1, displayedSamples.count - 1))
+                            let point = CGPoint(
+                                x: inset + drawWidth * progress,
+                                y: inset + drawHeight * (1.0 - displayedSamples[index])
+                            )
+                            if index == samples.startIndex {
+                                path.move(to: point)
+                            } else {
+                                path.addLine(to: point)
+                            }
+                        }
+                    }
+                    .stroke(
+                        Theme.Colors.bodyDark,
+                        style: StrokeStyle(lineWidth: 1.7, lineCap: .round, lineJoin: .round)
+                    )
+                } else {
+                    HStack(alignment: .bottom, spacing: 2) {
+                        ForEach(displayedSamples.indices, id: \.self) { index in
+                            Capsule()
+                                .fill(Theme.Colors.bodyDark.opacity(0.86))
+                                .frame(height: max(4, drawHeight * displayedSamples[index]))
+                        }
+                    }
+                    .padding(.horizontal, inset)
+                    .padding(.vertical, inset)
+                }
+            }
+        }
+    }
+
+    private var displayedSamples: [CGFloat] {
+        samples.isEmpty ? CameraManager.defaultHistogramSamples : samples
+    }
+}
+
+private struct GridGuideView: View {
+    let mode: GridGuideMode
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let height = geo.size.height
+            ZStack {
+                if mode == .thirds {
+                    guidePath(width: width, height: height, ratios: [1.0 / 3.0, 2.0 / 3.0])
+                        .stroke(
+                            Color.white.opacity(0.52),
+                            style: StrokeStyle(lineWidth: 1.9, lineCap: .round)
+                        )
+                } else if mode == .golden {
+                    guidePath(width: width, height: height, ratios: [0.382, 0.618])
+                        .stroke(
+                            Color.white.opacity(0.22),
+                            style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
+                        )
+                    goldenSpiralPath(width: width, height: height)
+                        .stroke(
+                            Color.white.opacity(0.58),
+                            style: StrokeStyle(lineWidth: 2.1, lineCap: .round, lineJoin: .round)
+                        )
+                }
+            }
+            .shadow(color: .black.opacity(0.26), radius: 1.5, x: 0, y: 0.5)
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func guidePath(width: CGFloat, height: CGFloat, ratios: [CGFloat]) -> Path {
+        Path { path in
+            for ratio in ratios {
+                let x = width * ratio
+                path.move(to: CGPoint(x: x, y: 0))
+                path.addLine(to: CGPoint(x: x, y: height))
+
+                let y = height * ratio
+                path.move(to: CGPoint(x: 0, y: y))
+                path.addLine(to: CGPoint(x: width, y: y))
+            }
+        }
+    }
+
+    private func goldenSpiralPath(width: CGFloat, height: CGFloat) -> Path {
+        Path { path in
+            let center = CGPoint(x: width * 0.62, y: height * 0.42)
+            let maxRadius = min(width, height) * 0.70
+            let pointCount = 160
+
+            for index in 0...pointCount {
+                let progress = CGFloat(index) / CGFloat(pointCount)
+                let angle = -CGFloat.pi * 0.15 + progress * CGFloat.pi * 4.25
+                let radius = maxRadius * CGFloat(pow(Double(progress), 1.55))
+                let point = CGPoint(
+                    x: center.x + CGFloat(cos(Double(angle))) * radius,
+                    y: center.y + CGFloat(sin(Double(angle))) * radius
+                )
+
+                if index == 0 {
+                    path.move(to: point)
+                } else {
+                    path.addLine(to: point)
+                }
+            }
+        }
+    }
+}
+
+private struct LevelGuideView: View {
+    let rollDegrees: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            let width = geo.size.width
+            let height = geo.size.height
+            let centerY = height / 2.0
+            let isLevel = abs(rollDegrees) < 1.0
+            let guideColor = isLevel ? Color.green.opacity(0.92) : Color.white.opacity(0.72)
+            let referenceColor = Color.white.opacity(0.22)
+
+            ZStack {
+                Path { path in
+                    path.move(to: CGPoint(x: width * 0.18, y: centerY))
+                    path.addLine(to: CGPoint(x: width * 0.82, y: centerY))
+                }
+                .stroke(referenceColor, style: StrokeStyle(lineWidth: 1.4, lineCap: .round, dash: [6, 8]))
+
+                Path { path in
+                    path.move(to: CGPoint(x: width * 0.17, y: centerY))
+                    path.addLine(to: CGPoint(x: width * 0.44, y: centerY))
+                    path.move(to: CGPoint(x: width * 0.56, y: centerY))
+                    path.addLine(to: CGPoint(x: width * 0.83, y: centerY))
+                }
+                .stroke(
+                    guideColor,
+                    style: StrokeStyle(lineWidth: isLevel ? 4.2 : 3.2, lineCap: .round)
+                )
+                .rotationEffect(.degrees(rollDegrees), anchor: .center)
+                .shadow(color: .black.opacity(0.35), radius: 3, x: 0, y: 1)
+
+                RoundedRectangle(cornerRadius: 2.5)
+                    .fill(guideColor)
+                    .frame(width: isLevel ? 18 : 14, height: isLevel ? 5 : 4)
+                    .position(x: width / 2.0, y: centerY)
+                    .shadow(color: .black.opacity(0.30), radius: 2, x: 0, y: 1)
+            }
+        }
+        .allowsHitTesting(false)
     }
 }
 

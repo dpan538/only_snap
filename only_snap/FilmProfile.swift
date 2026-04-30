@@ -7,11 +7,16 @@ enum FilmProfile: String, CaseIterable, Sendable {
 
     nonisolated var label: String {
         switch self {
-        case .raw: return "raw"
+        case .raw: return "SD"
         case .vg:  return "VG"
         case .ew:  return "EW"
         }
     }
 
-    nonisolated var logName: String { rawValue }
+    nonisolated var logName: String {
+        switch self {
+        case .raw: return "sd"
+        case .vg, .ew: return rawValue
+        }
+    }
 }
