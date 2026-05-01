@@ -37,13 +37,13 @@ enum CropManager {
             let h = CGFloat(image.height)
             let croppedW = w / cropFactor
             let croppedH = h / cropFactor
-            let originX  = (w - croppedW) / 2.0
-            let originY  = (h - croppedH) / 2.0
 
-            var focalRect = CGRect(x: originX, y: originY, width: croppedW, height: croppedH)
-            focalRect = focalRect.intersection(CGRect(x: 0, y: 0, width: w, height: h))
-
-            guard let cropped = image.cropping(to: focalRect.integral) else { return nil }
+            let focalRect = centeredPixelAlignedRect(
+                width: croppedW,
+                height: croppedH,
+                in: CGRect(x: 0, y: 0, width: w, height: h)
+            )
+            guard let cropped = image.cropping(to: focalRect) else { return nil }
             focalCropped = cropped
         }
 
@@ -92,12 +92,22 @@ enum CropManager {
             targetHeight = srcH
         }
 
-        let x = (srcW - targetWidth)  / 2.0
-        let y = (srcH - targetHeight) / 2.0
+        let aspectRect = centeredPixelAlignedRect(
+            width: targetWidth,
+            height: targetHeight,
+            in: CGRect(x: 0, y: 0, width: srcW, height: srcH)
+        )
+        return focalCropped.cropping(to: aspectRect)
+    }
 
-        var aspectRect = CGRect(x: x, y: y, width: targetWidth, height: targetHeight)
-        aspectRect = aspectRect.intersection(CGRect(x: 0, y: 0, width: srcW, height: srcH))
+    private static func centeredPixelAlignedRect(width: CGFloat, height: CGFloat, in bounds: CGRect) -> CGRect {
+        let alignedWidth = max(2, floor(min(width, bounds.width) / 2.0) * 2.0)
+        let alignedHeight = max(2, floor(min(height, bounds.height) / 2.0) * 2.0)
+        let x = floor(bounds.midX - alignedWidth * 0.5)
+        let y = floor(bounds.midY - alignedHeight * 0.5)
 
-        return focalCropped.cropping(to: aspectRect.integral)
+        return CGRect(x: x, y: y, width: alignedWidth, height: alignedHeight)
+            .intersection(bounds)
+            .integral
     }
 }

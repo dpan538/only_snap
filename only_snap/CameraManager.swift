@@ -19,6 +19,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     @Published private(set) var pendingFilmProfile: FilmProfile?
     @Published private(set) var isVGReady = false
     @Published private(set) var isEWReady = false
+    @Published private(set) var isLGReady = false
     @Published private(set) var selectedFocalLength = 28
     @Published private(set) var selectedAspectFormat: AspectFormat = .threeToFour
     @Published private(set) var flashEnabled = false
@@ -58,9 +59,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     nonisolated(unsafe) private var isSessionConfigured = false
     nonisolated(unsafe) private var sessionSelectedFocalLength = 28
     nonisolated(unsafe) private var sessionFlashEnabled = false
-    nonisolated(unsafe) private var sessionAELocked = false
-    nonisolated(unsafe) private var sessionMeteringMode = MeteringMode.matrix
-    nonisolated(unsafe) private var sessionMeteringBias: Float = 0
+    nonisolated(unsafe) private var meteringState = MeteringRuntimeState()
     nonisolated(unsafe) private var sessionCaptureOutputKind = CaptureOutputKind.jpg
     nonisolated(unsafe) private var sessionOrientation = CameraOrientationState.portrait
     nonisolated(unsafe) private var lastAppliedOrientationState: CameraOrientationState?
@@ -71,7 +70,6 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     nonisolated(unsafe) private var sessionMaxPhotoDimensions: CMVideoDimensions?
     nonisolated(unsafe) private var cameraCapabilities = CameraCapabilities.empty
     nonisolated(unsafe) private var lastHistogramUpdateAt: TimeInterval = 0
-    nonisolated(unsafe) private var lastMeteringBiasUpdateAt: TimeInterval = 0
     private var previousStandardAspectFormat: AspectFormat = .threeToFour
 
     // MARK: - Observers / delegates
@@ -86,12 +84,14 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
     private var cameraPermissionGranted = false
     private var photoPermissionGranted = false
-    private var launchStartedAt = CameraManager.now()
+    nonisolated(unsafe) private var launchStartedAt = CameraManager.now()
     private var didReportFirstPreviewFrame = false
     private var didStartVGPreheat = false
     private var didStartEWPreheat = false
+    private var didStartLGPreheat = false
     private var vgPreheatStartedAt: TimeInterval?
     private var ewPreheatStartedAt: TimeInterval?
+    private var lgPreheatStartedAt: TimeInterval?
     private var profileRequestStartedAt: [FilmProfile: TimeInterval] = [:]
     private var didLogInitialOrientationState = false
     nonisolated(unsafe) private var pendingOrientationTransition: PendingOrientationTransition?
@@ -99,10 +99,16 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     nonisolated(unsafe) private var startupStartRunningEndedAt: TimeInterval?
     private static let outputJPEGQuality: CGFloat = 0.95
     private static let outputHEIFQuality: CGFloat = 0.93
+    private static let outputTargetPixels: CGFloat = 36_000_000
+    private static let outputResizeTolerance: CGFloat = 0.01
+    private static let fullFrame35mmWidth: CGFloat = 36
     private static let nominalUltraWideEquivalent: CGFloat = 15
     private static let nominalWideEquivalent: CGFloat = 28
     private static let nominalTeleShortEquivalent: CGFloat = 77
     private static let nominalTeleLongEquivalent: CGFloat = 120
+    private static let outputColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+        ?? CGColorSpaceCreateDeviceRGB()
+    private let meteringTuning = MeteringTuning.default
     static let defaultHistogramSamples: [CGFloat] = [
         0.40, 0.46, 0.44, 0.52, 0.50, 0.58, 0.62, 0.56,
         0.48, 0.44, 0.50, 0.60, 0.72, 0.66, 0.54, 0.46,
@@ -165,6 +171,91 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             }
             return [15, 28, 43, 85]
         }
+    }
+
+    private struct MeteringTuning {
+        let histogramInterval: TimeInterval
+        let adaptiveInterval: TimeInterval
+        let biasDeadband: Float
+        let applyDeadband: Float
+        let smoothingTau: Float
+        let fastResponseThreshold: Float
+        let shadowThreshold: CGFloat
+        let highlightThreshold: CGFloat
+        let hardHighlightThreshold: CGFloat
+
+        static let `default` = MeteringTuning(
+            histogramInterval: 0.14,
+            adaptiveInterval: 0.55,
+            biasDeadband: 0.07,
+            applyDeadband: 0.035,
+            smoothingTau: 1.15,
+            fastResponseThreshold: 0.30,
+            shadowThreshold: 0.18,
+            highlightThreshold: 0.82,
+            hardHighlightThreshold: 0.92
+        )
+    }
+
+    private struct MeteringRuntimeState {
+        var bias: Float = 0
+        var smoothedBias: Float = 0
+        var lastUpdateTime: TimeInterval = 0
+        var lastSmoothingTime: TimeInterval = 0
+        var lastDesiredBias: Float = 0
+        var mode: MeteringMode = .matrix
+        var aeLocked: Bool = false
+        var adaptivePausedUntil: TimeInterval = 0
+    }
+
+    private struct MeteringZoneSummary: Sendable {
+        let rows: Int
+        let columns: Int
+        let means: [CGFloat]
+        let counts: [Int]
+        let shadowShares: [CGFloat]
+        let highlightShares: [CGFloat]
+        let hardHighlightShares: [CGFloat]
+        let globalMean: CGFloat
+        let globalShadowShare: CGFloat
+        let globalHighlightShare: CGFloat
+        let globalHardHighlightShare: CGFloat
+    }
+
+    private struct MeteringWeightedStats {
+        let mean: CGFloat
+        let shadowShare: CGFloat
+        let highlightShare: CGFloat
+        let hardHighlightShare: CGFloat
+    }
+
+    private struct ExposureEnvironment {
+        enum Kind: String {
+            case balanced
+            case overcast
+            case lowLight
+            case highKey
+            case highContrast
+            case hardHighlight
+            case backlit
+        }
+
+        let kind: Kind
+        let intensity: CGFloat
+    }
+
+    private struct MeteringBiasDecision {
+        let desiredBias: Float
+        let environment: ExposureEnvironment
+    }
+
+    private struct ExposureResponse {
+        let smoothingTau: Float
+        let maxAlpha: Float
+        let fastResponseThreshold: Float
+        let fastAlpha: Float
+        let positiveStep: Float
+        let negativeStep: Float
     }
 
     // MARK: - Rendering
@@ -390,17 +481,23 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             do {
                 try device.lockForConfiguration()
                 let applied: Bool
+                let shouldRampBiasToZero: Bool
                 do {
                     defer { device.unlockForConfiguration() }
                     if target {
                         applied = self.applyExposureLockLocked(to: device, locked: true)
+                        shouldRampBiasToZero = false
                     } else {
                         _ = self.applyExposureLockLocked(to: device, locked: false)
-                        self.applyMeteringModeLocked(to: device, mode: self.sessionMeteringMode)
+                        self.applyMeteringModeLocked(to: device, mode: self.meteringState.mode)
                         applied = false
+                        shouldRampBiasToZero = true
                     }
                 }
-                self.sessionAELocked = applied
+                self.meteringState.aeLocked = applied
+                if shouldRampBiasToZero {
+                    self.scheduleBiasRampToZero()
+                }
                 DispatchQueue.main.async {
                     self.isAELocked = applied
                 }
@@ -420,16 +517,17 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     func cycleMeteringMode() {
         let next = meteringMode.next
         meteringMode = next
-        sessionMeteringMode = next
         RuntimeLog.info("[Exposure]", "meteringMode=\(next.logName)")
 
         sessionQueue.async {
+            self.meteringState.mode = next
             guard let device = self.currentDevice else { return }
             do {
                 try device.lockForConfiguration()
                 defer { device.unlockForConfiguration() }
+                self.resetMeteringBiasLocked(to: device)
                 self.applyMeteringModeLocked(to: device, mode: next)
-                if self.sessionAELocked {
+                if self.meteringState.aeLocked {
                     _ = self.applyExposureLockLocked(to: device, locked: true)
                 }
             } catch {
@@ -446,6 +544,8 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             guard activeFilmProfile != .vg, pendingFilmProfile != .vg else { return }
         case .ew:
             guard activeFilmProfile != .ew, pendingFilmProfile != .ew else { return }
+        case .lg:
+            guard activeFilmProfile != .lg, pendingFilmProfile != .lg else { return }
         }
 
         profileRequestStartedAt[profile] = Self.now()
@@ -484,6 +584,23 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                 RuntimeLog.info(
                     "[FilmProfile]",
                     "requested=ew active=\(activeFilmProfile.logName) ready=false pending=true"
+                )
+            }
+        case .lg:
+            if isLGReady {
+                pendingFilmProfile = nil
+                activeFilmProfile = .lg
+                let elapsed = profileRequestStartedAt[.lg].map { Self.now() - $0 } ?? 0
+                RuntimeLog.info(
+                    "[FilmProfile]",
+                    "requested=lg active=lg ready=true elapsed=\(Self.formatDuration(elapsed))"
+                )
+            } else {
+                pendingFilmProfile = .lg
+                preheatLGResourcesIfNeeded()
+                RuntimeLog.info(
+                    "[FilmProfile]",
+                    "requested=lg active=\(activeFilmProfile.logName) ready=false pending=true"
                 )
             }
         }
@@ -554,7 +671,9 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
     nonisolated func updatePreviewHistogram(from pixelBuffer: CVPixelBuffer) {
         let now = Self.now()
-        guard now - lastHistogramUpdateAt >= 0.10 else { return }
+        let isStartupWarmup = now - launchStartedAt < 1.6
+        let effectiveHistogramInterval = isStartupWarmup ? 0.28 : meteringTuning.histogramInterval
+        guard now - lastHistogramUpdateAt >= effectiveHistogramInterval else { return }
         lastHistogramUpdateAt = now
 
         let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
@@ -571,6 +690,22 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         let bucketCount = 24
         var buckets = Array(repeating: 0, count: bucketCount)
+        let shouldCollectMeteringZones = !isStartupWarmup
+            && pendingFocalTransition == nil
+            && pendingOrientationTransition == nil
+        let zoneRows = 6
+        let zoneColumns = 8
+        let zoneCount = zoneRows * zoneColumns
+        var zoneLumaSums = shouldCollectMeteringZones ? Array(repeating: CGFloat(0), count: zoneCount) : []
+        var zoneCounts = shouldCollectMeteringZones ? Array(repeating: 0, count: zoneCount) : []
+        var zoneShadowCounts = shouldCollectMeteringZones ? Array(repeating: 0, count: zoneCount) : []
+        var zoneHighlightCounts = shouldCollectMeteringZones ? Array(repeating: 0, count: zoneCount) : []
+        var zoneHardHighlightCounts = shouldCollectMeteringZones ? Array(repeating: 0, count: zoneCount) : []
+        var globalLumaSum: CGFloat = 0
+        var globalSampleCount = 0
+        var globalShadowCount = 0
+        var globalHighlightCount = 0
+        var globalHardHighlightCount = 0
         let stepX = max(1, width / 48)
         let stepY = max(1, height / 32)
 
@@ -585,6 +720,29 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
                 let luma = (0.2126 * red + 0.7152 * green + 0.0722 * blue).clamped(to: 0...1)
                 let index = min(bucketCount - 1, Int(luma * CGFloat(bucketCount)))
                 buckets[index] += 1
+
+                if shouldCollectMeteringZones {
+                    let zoneX = min(zoneColumns - 1, x * zoneColumns / max(1, width))
+                    let zoneY = min(zoneRows - 1, y * zoneRows / max(1, height))
+                    let zoneIndex = zoneY * zoneColumns + zoneX
+                    zoneLumaSums[zoneIndex] += luma
+                    zoneCounts[zoneIndex] += 1
+
+                    globalLumaSum += luma
+                    globalSampleCount += 1
+                    if luma < meteringTuning.shadowThreshold {
+                        zoneShadowCounts[zoneIndex] += 1
+                        globalShadowCount += 1
+                    }
+                    if luma > meteringTuning.highlightThreshold {
+                        zoneHighlightCounts[zoneIndex] += 1
+                        globalHighlightCount += 1
+                    }
+                    if luma > meteringTuning.hardHighlightThreshold {
+                        zoneHardHighlightCounts[zoneIndex] += 1
+                        globalHardHighlightCount += 1
+                    }
+                }
                 x += stepX
             }
             y += stepY
@@ -592,11 +750,71 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         let maxCount = max(1, buckets.max() ?? 1)
         let normalized = buckets.map { CGFloat($0) / CGFloat(maxCount) }
-        updateAdaptiveMeteringBiasIfNeeded(buckets: buckets, now: now)
+        if shouldCollectMeteringZones {
+            let zones = makeMeteringZoneSummary(
+                rows: zoneRows,
+                columns: zoneColumns,
+                lumaSums: zoneLumaSums,
+                counts: zoneCounts,
+                shadowCounts: zoneShadowCounts,
+                highlightCounts: zoneHighlightCounts,
+                hardHighlightCounts: zoneHardHighlightCounts,
+                globalLumaSum: globalLumaSum,
+                globalSampleCount: globalSampleCount,
+                globalShadowCount: globalShadowCount,
+                globalHighlightCount: globalHighlightCount,
+                globalHardHighlightCount: globalHardHighlightCount
+            )
+            updateAdaptiveMeteringBiasIfNeeded(buckets: buckets, zones: zones, now: now)
+        }
 
         DispatchQueue.main.async { [weak self] in
             self?.histogramSamples = normalized
         }
+    }
+
+    nonisolated private func makeMeteringZoneSummary(
+        rows: Int,
+        columns: Int,
+        lumaSums: [CGFloat],
+        counts: [Int],
+        shadowCounts: [Int],
+        highlightCounts: [Int],
+        hardHighlightCounts: [Int],
+        globalLumaSum: CGFloat,
+        globalSampleCount: Int,
+        globalShadowCount: Int,
+        globalHighlightCount: Int,
+        globalHardHighlightCount: Int
+    ) -> MeteringZoneSummary {
+        let means = lumaSums.enumerated().map { index, sum in
+            let count = max(1, counts[index])
+            return sum / CGFloat(count)
+        }
+        let shadowShares = shadowCounts.enumerated().map { index, count in
+            CGFloat(count) / CGFloat(max(1, counts[index]))
+        }
+        let highlightShares = highlightCounts.enumerated().map { index, count in
+            CGFloat(count) / CGFloat(max(1, counts[index]))
+        }
+        let hardHighlightShares = hardHighlightCounts.enumerated().map { index, count in
+            CGFloat(count) / CGFloat(max(1, counts[index]))
+        }
+        let total = max(1, globalSampleCount)
+
+        return MeteringZoneSummary(
+            rows: rows,
+            columns: columns,
+            means: means,
+            counts: counts,
+            shadowShares: shadowShares,
+            highlightShares: highlightShares,
+            hardHighlightShares: hardHighlightShares,
+            globalMean: globalLumaSum / CGFloat(total),
+            globalShadowShare: CGFloat(globalShadowCount) / CGFloat(total),
+            globalHighlightShare: CGFloat(globalHighlightCount) / CGFloat(total),
+            globalHardHighlightShare: CGFloat(globalHardHighlightCount) / CGFloat(total)
+        )
     }
 
     func notifyFirstPreviewFrame() {
@@ -615,6 +833,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         }
         preheatVGResourcesIfNeeded()
         preheatEWResourcesIfNeeded()
+        preheatLGResourcesIfNeeded()
     }
 
     func notifyPreviewFrameRendered(
@@ -1141,6 +1360,37 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         }
     }
 
+    private func preheatLGResourcesIfNeeded() {
+        guard !didStartLGPreheat else { return }
+        didStartLGPreheat = true
+        lgPreheatStartedAt = Self.now()
+
+        RuntimeLog.info("[FilmProfile]", "lgPreheatStarted lgPreheatStartedAfterFirstFrame=true")
+        profilePreheatQueue.async {
+            FilmProfileProcessor.preheatResources(for: .lg)
+            let elapsed = Self.now() - (self.lgPreheatStartedAt ?? Self.now())
+
+            DispatchQueue.main.async {
+                self.isLGReady = true
+                RuntimeLog.info(
+                    "[FilmProfile]",
+                    "lgPreheatCompleted elapsed=\(Self.formatDuration(elapsed))"
+                )
+
+                if self.pendingFilmProfile == .lg {
+                    self.pendingFilmProfile = nil
+                    self.activeFilmProfile = .lg
+                    let switchElapsed = self.profileRequestStartedAt[.lg].map { Self.now() - $0 } ?? 0
+                    RuntimeLog.info(
+                        "[FilmProfile]",
+                        "requested=lg active=lg source=preheatCompletion elapsed=\(Self.formatDuration(switchElapsed))"
+                    )
+                    self.applyCameraOrientationAsync(reason: "filmProfileChanged")
+                }
+            }
+        }
+    }
+
     // MARK: - Photo processing
 
     fileprivate func handleCapturedPhoto(
@@ -1160,11 +1410,16 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         )
 
         if outputKind == .dng {
+            let extractionStartedAt = Self.now()
             guard let dngData = photo.fileDataRepresentation() else {
                 await MainActor.run { captureError = "Failed to extract DNG data" }
                 RuntimeLog.error("[Error]", "dngExtractionFailed")
                 return
             }
+            RuntimeLog.info(
+                "[PhotoProcessing]",
+                "dngExtractionElapsed=\(Self.formatDuration(Self.now() - extractionStartedAt)) bytes=\(dngData.count)"
+            )
 
             do {
                 RuntimeLog.info("[Capture]", "saveStarted output=dng")
@@ -1187,19 +1442,29 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             return
         }
 
+        let extractionStartedAt = Self.now()
         guard let cgImage = photo.cgImageRepresentation() else {
             await MainActor.run { captureError = "Failed to extract image data" }
             RuntimeLog.error("[Error]", "photoExtractionFailed")
             return
         }
         let sourceDimensions = "\(cgImage.width)x\(cgImage.height)"
+        RuntimeLog.info(
+            "[PhotoProcessing]",
+            "extractStage elapsed=\(Self.formatDuration(Self.now() - extractionStartedAt)) source=\(sourceDimensions)"
+        )
 
+        let cropStartedAt = Self.now()
         guard let cropped = CropManager.crop(image: cgImage, format: format, cropFactor: cropFactor) else {
             await MainActor.run { captureError = "Crop failed" }
             RuntimeLog.error("[Error]", "photoCropFailed format=\(format.label)")
             return
         }
         let cropDimensions = "\(cropped.width)x\(cropped.height)"
+        RuntimeLog.info(
+            "[PhotoProcessing]",
+            "cropStage elapsed=\(Self.formatDuration(Self.now() - cropStartedAt)) crop=\(cropDimensions)"
+        )
         let qualityMetrics = Self.photoQualityMetrics(from: photo)
         let isoValue = qualityMetrics.iso
         RuntimeLog.info(
@@ -1207,10 +1472,15 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             "profile=\(filmProfile.logName) focal=\(focalLength) format=\(format.label) iso=\(Self.format(isoValue)) exposure=\(Self.formatExposure(qualityMetrics.exposureSeconds)) fNumber=\(Self.formatOptional(qualityMetrics.fNumber)) brightness=\(Self.formatOptional(qualityMetrics.brightnessValue)) wb=\(Self.whiteBalanceLogName(qualityMetrics.whiteBalance)) source=\(sourceDimensions) crop=\(cropDimensions)"
         )
 
+        let prepareStartedAt = Self.now()
         let baseImage = correctDistortionIfNeeded(
             CIImage(cgImage: cropped),
             photo: photo,
             focalLength: focalLength
+        )
+        RuntimeLog.info(
+            "[PhotoProcessing]",
+            "prepareStage elapsed=\(Self.formatDuration(Self.now() - prepareStartedAt))"
         )
         let profileStartedAt = Self.now()
         let profiledImage = FilmProfileProcessor.apply(
@@ -1224,16 +1494,15 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             "profileStage=\(filmProfile.logName) elapsed=\(Self.formatDuration(Self.now() - profileStartedAt)) input=\(cropDimensions)"
         )
 
-        let targetOutputMP: CGFloat = 36_000_000
+        let resizeStartedAt = Self.now()
         let inputWidth = CGFloat(normalizedProfiledImage.extent.width)
         let inputHeight = CGFloat(normalizedProfiledImage.extent.height)
         let inputMP = inputWidth * inputHeight
 
         let requestedScaleFactor: CGFloat
-        if inputMP < targetOutputMP * 0.98 {
-            requestedScaleFactor = min(2.0, sqrt(targetOutputMP / inputMP))
-        } else if inputMP > targetOutputMP * 1.02 {
-            requestedScaleFactor = max(0.5, sqrt(targetOutputMP / inputMP))
+        if inputMP < Self.outputTargetPixels * (1 - Self.outputResizeTolerance)
+            || inputMP > Self.outputTargetPixels * (1 + Self.outputResizeTolerance) {
+            requestedScaleFactor = sqrt(Self.outputTargetPixels / max(inputMP, 1))
         } else {
             requestedScaleFactor = 1.0
         }
@@ -1242,60 +1511,48 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         let resampledImage: CIImage
         let resizeDisposition: String
-        if requestedScaleFactor > 1.02 {
-            if let scaleFilter = CIFilter(name: "CILanczosScaleTransform") {
-                let outputExtent = Self.scaledExtent(
-                    for: normalizedProfiledImage.extent,
-                    scale: requestedScaleFactor
-                )
-                scaleFilter.setValue(normalizedProfiledImage, forKey: kCIInputImageKey)
-                scaleFilter.setValue(requestedScaleFactor, forKey: kCIInputScaleKey)
-                scaleFilter.setValue(1.0, forKey: "inputAspectRatio")
-                resampledImage = (scaleFilter.outputImage ?? normalizedProfiledImage)
-                    .cropped(to: outputExtent)
-            } else {
-                resampledImage = normalizedProfiledImage
-            }
+        if requestedScaleFactor > 1 + Self.outputResizeTolerance {
+            resampledImage = Self.highQualityResampledImage(
+                normalizedProfiledImage,
+                scale: requestedScaleFactor
+            )
             resizeDisposition = "upscaled"
             RuntimeLog.info(
                 "[PhotoProcessing]",
-                "outputResize applied reason=upscale source=\(Int(inputWidth))x\(Int(inputHeight)) target=\(requestedOutputWidth)x\(requestedOutputHeight)"
+                "outputResize applied reason=upscale source=\(Int(inputWidth))x\(Int(inputHeight)) target=\(requestedOutputWidth)x\(requestedOutputHeight) scale=\(Self.format(requestedScaleFactor)) targetMP=\(Self.format(Self.outputTargetPixels / 1_000_000.0))"
             )
-        } else if requestedScaleFactor < 0.98 {
-            if let scaleFilter = CIFilter(name: "CILanczosScaleTransform") {
-                let outputExtent = Self.scaledExtent(
-                    for: normalizedProfiledImage.extent,
-                    scale: requestedScaleFactor
-                )
-                scaleFilter.setValue(normalizedProfiledImage, forKey: kCIInputImageKey)
-                scaleFilter.setValue(requestedScaleFactor, forKey: kCIInputScaleKey)
-                scaleFilter.setValue(1.0, forKey: "inputAspectRatio")
-                resampledImage = (scaleFilter.outputImage ?? normalizedProfiledImage)
-                    .cropped(to: outputExtent)
-            } else {
-                resampledImage = normalizedProfiledImage
-            }
+        } else if requestedScaleFactor < 1 - Self.outputResizeTolerance {
+            resampledImage = Self.highQualityResampledImage(
+                normalizedProfiledImage,
+                scale: requestedScaleFactor
+            )
             resizeDisposition = "downscaled"
             RuntimeLog.info(
                 "[PhotoProcessing]",
-                "outputResize applied reason=downscale source=\(Int(inputWidth))x\(Int(inputHeight)) target=\(requestedOutputWidth)x\(requestedOutputHeight)"
+                "outputResize applied reason=downscale source=\(Int(inputWidth))x\(Int(inputHeight)) target=\(requestedOutputWidth)x\(requestedOutputHeight) scale=\(Self.format(requestedScaleFactor)) targetMP=\(Self.format(Self.outputTargetPixels / 1_000_000.0))"
             )
         } else {
             resizeDisposition = "native"
             resampledImage = normalizedProfiledImage
         }
+        RuntimeLog.info(
+            "[PhotoProcessing]",
+            "resizeStage elapsed=\(Self.formatDuration(Self.now() - resizeStartedAt)) disposition=\(resizeDisposition) target=\(requestedOutputWidth)x\(requestedOutputHeight) targetMP=\(Self.format(Self.outputTargetPixels / 1_000_000.0))"
+        )
 
         let detailPlan = Self.detailProcessingPlan(
             profile: filmProfile,
             focalLength: focalLength,
             digitalZoomFactor: digitalZoomFactor,
-            iso: isoValue
+            iso: isoValue,
+            resampleScale: requestedScaleFactor
         )
         RuntimeLog.info(
             "[DetailPipeline]",
-            "profile=\(filmProfile.logName) focal=\(focalLength) zoom=\(Self.format(digitalZoomFactor)) iso=\(Self.format(isoValue)) order=denoiseThenSharpen sharpen=\(Self.format(CGFloat(detailPlan.sharpenIntensity))) radius=\(Self.format(CGFloat(detailPlan.sharpenRadius))) denoise=\(detailPlan.shouldDenoise ? Self.format(CGFloat(detailPlan.noiseLevel)) : "off") reason=\(detailPlan.reason)"
+            "profile=\(filmProfile.logName) focal=\(focalLength) zoom=\(Self.format(digitalZoomFactor)) resizeScale=\(Self.format(requestedScaleFactor)) iso=\(Self.format(isoValue)) order=denoiseThenSharpen sharpen=\(Self.format(CGFloat(detailPlan.sharpenIntensity))) radius=\(Self.format(CGFloat(detailPlan.sharpenRadius))) denoise=\(detailPlan.shouldDenoise ? Self.format(CGFloat(detailPlan.noiseLevel)) : "off") reason=\(detailPlan.reason)"
         )
 
+        let detailStartedAt = Self.now()
         let denoisedImage: CIImage
         if detailPlan.shouldDenoise, let noiseFilter = CIFilter(name: "CINoiseReduction") {
             noiseFilter.setValue(resampledImage.clampedToExtent(), forKey: kCIInputImageKey)
@@ -1322,6 +1579,10 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         } else {
             finalImage = denoisedImage
         }
+        RuntimeLog.info(
+            "[PhotoProcessing]",
+            "detailStage elapsed=\(Self.formatDuration(Self.now() - detailStartedAt)) denoise=\(detailPlan.shouldDenoise)"
+        )
 
         let renderImage = finalImage.transformed(
             by: CGAffineTransform(
@@ -1330,12 +1591,22 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             )
         )
         let renderExtent = CGRect(origin: .zero, size: finalImage.extent.size)
-        guard let outputCGImage = photoCIContext.createCGImage(renderImage, from: renderExtent) else {
+        let renderStartedAt = Self.now()
+        guard let outputCGImage = photoCIContext.createCGImage(
+            renderImage,
+            from: renderExtent,
+            format: .RGBA8,
+            colorSpace: Self.outputColorSpace
+        ) else {
             await MainActor.run { captureError = "Failed to render final image" }
             RuntimeLog.error("[Error]", "finalImageRenderFailed")
             return
         }
         let outputDimensions = "\(outputCGImage.width)x\(outputCGImage.height)"
+        RuntimeLog.info(
+            "[PhotoProcessing]",
+            "renderStage elapsed=\(Self.formatDuration(Self.now() - renderStartedAt)) output=\(outputDimensions)"
+        )
         RuntimeLog.info(
             "[PhotoProcessing]",
             "profile=\(filmProfile.logName) format=\(format.label) output=\(outputKind.logName) source=\(sourceDimensions) crop=\(cropDimensions) outputDimensions=\(outputDimensions) resize=\(resizeDisposition)"
@@ -1413,6 +1684,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         exif: [String: Any],
         outputKind: CaptureOutputKind
     ) async throws {
+        let encodeStartedAt = Self.now()
         guard let imageUTI = outputKind.imageUTI else {
             throw CameraError.saveFailed
         }
@@ -1436,10 +1708,13 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         }
 
         let finalData = data as Data
+        let encodeElapsed = Self.now() - encodeStartedAt
+        let libraryStartedAt = Self.now()
         try await savePhotoDataToLibrary(finalData)
+        let libraryElapsed = Self.now() - libraryStartedAt
         RuntimeLog.info(
             "[PhotoProcessing]",
-            "encoded output=\(outputKind.logName) bytes=\(finalData.count) quality=\(Self.format(outputKind == .heif ? Self.outputHEIFQuality : Self.outputJPEGQuality))"
+            "encoded output=\(outputKind.logName) bytes=\(finalData.count) quality=\(Self.format(outputKind == .heif ? Self.outputHEIFQuality : Self.outputJPEGQuality)) encodeElapsed=\(Self.formatDuration(encodeElapsed)) libraryElapsed=\(Self.formatDuration(libraryElapsed))"
         )
     }
 
@@ -1585,7 +1860,10 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             baseEquivalent: CGFloat,
             device: AVCaptureDevice
         ) -> CGFloat {
-            let desired = CGFloat(targetMM) / max(baseEquivalent, 0.001)
+            let desired = Self.zoomFactor(
+                targetFocalLength: CGFloat(targetMM),
+                baseEquivalentFocalLength: baseEquivalent
+            )
             return min(
                 max(desired, device.minAvailableVideoZoomFactor),
                 device.maxAvailableVideoZoomFactor
@@ -1593,14 +1871,17 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         }
 
         func virtualZoom(targetMM: Int, baseEquivalent: CGFloat) -> CGFloat? {
-            let targetZoom = CGFloat(targetMM) / max(baseEquivalent, 0.001)
+            let targetZoom = Self.zoomFactor(
+                targetFocalLength: CGFloat(targetMM),
+                baseEquivalentFocalLength: baseEquivalent
+            )
             return capabilities.virtualSwitchFactors.first {
                 abs($0 - targetZoom) / max(targetZoom, 0.001) < 0.015
             }
         }
 
         func wideSelection(targetMM: Int, fallbackReason: String?) -> FocalSelection {
-            let baseEquivalent = Self.nominalWideEquivalent
+            let baseEquivalent = capabilities.wide35mmEquivalent
             if let zoom = virtualZoom(targetMM: targetMM, baseEquivalent: baseEquivalent) {
                 return FocalSelection(
                     device: wide,
@@ -1624,9 +1905,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             guard let teleEquivalent = capabilities.telephoto35mmEquivalent else {
                 return Self.nominalTeleShortEquivalent
             }
-            return teleEquivalent >= 100
-                ? Self.nominalTeleLongEquivalent
-                : Self.nominalTeleShortEquivalent
+            return teleEquivalent
         }
 
         switch mm {
@@ -1634,7 +1913,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             if let ultraWide = find(.builtInUltraWideCamera) {
                 let zoom = clampedZoom(
                     targetMM: mm,
-                    baseEquivalent: Self.nominalUltraWideEquivalent,
+                    baseEquivalent: capabilities.ultraWide35mmEquivalent ?? Self.nominalUltraWideEquivalent,
                     device: ultraWide
                 )
                 return FocalSelection(
@@ -1661,7 +1940,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         case 77:
             if let tele = find(.builtInTelephotoCamera),
-               teleBaseEquivalent() == Self.nominalTeleShortEquivalent {
+               teleBaseEquivalent() < 100 {
                 return FocalSelection(
                     device: tele,
                     zoomFactor: clampedZoom(targetMM: mm, baseEquivalent: teleBaseEquivalent(), device: tele),
@@ -1674,7 +1953,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         case 85:
             if let tele = find(.builtInTelephotoCamera),
-               teleBaseEquivalent() == Self.nominalTeleShortEquivalent {
+               teleBaseEquivalent() < 100 {
                 return FocalSelection(
                     device: tele,
                     zoomFactor: clampedZoom(targetMM: mm, baseEquivalent: teleBaseEquivalent(), device: tele),
@@ -1909,14 +2188,20 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
 
         guard let wide = discovery.devices.first else { return nil }
 
-        let wideEquivalent = Self.nominalWideEquivalent
+        let wideEquivalent = equivalentFocalLength(for: wide)
         let desiredZoom: CGFloat
 
         switch mm {
         case 15, 28, 43, 77, 85, 120:
-            desiredZoom = max(CGFloat(mm) / wideEquivalent, 1.0)
+            desiredZoom = Self.zoomFactor(
+                targetFocalLength: CGFloat(mm),
+                baseEquivalentFocalLength: wideEquivalent
+            )
         default:
-            desiredZoom = max(28.0 / wideEquivalent, 1.0)
+            desiredZoom = Self.zoomFactor(
+                targetFocalLength: Self.nominalWideEquivalent,
+                baseEquivalentFocalLength: wideEquivalent
+            )
         }
 
         let zoom = min(max(desiredZoom, wide.minAvailableVideoZoomFactor), wide.maxAvailableVideoZoomFactor)
@@ -1934,9 +2219,17 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         let tangent = tan(radians / 2.0)
         guard tangent > 0 else { return 24.0 }
 
-        // AVCaptureDevice.Format does not expose physical focal length in the
-        // current public SDK, so the active format's FOV is the calibration source.
-        return 21.635 / tangent
+        // videoFieldOfView is the horizontal FOV. For a 35mm-equivalent
+        // horizontal frame width of 36mm, equivalent focal length is:
+        // f = (36 / 2) / tan(horizontalFOV / 2).
+        return (Self.fullFrame35mmWidth * 0.5) / tangent
+    }
+
+    private static func zoomFactor(
+        targetFocalLength: CGFloat,
+        baseEquivalentFocalLength: CGFloat
+    ) -> CGFloat {
+        max(targetFocalLength / max(baseEquivalentFocalLength, 0.001), 1.0)
     }
 
     @discardableResult
@@ -1957,13 +2250,13 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             targetFocalLength: mm
         )
         device.videoZoomFactor = calibration.zoomFactor
-        applyMeteringModeLocked(to: device, mode: sessionMeteringMode)
+        applyMeteringModeLocked(to: device, mode: meteringState.mode)
         let effectiveAELock = applyExposureLockLocked(
             to: device,
-            locked: sessionAELocked
+            locked: meteringState.aeLocked
         )
-        if effectiveAELock != sessionAELocked {
-            sessionAELocked = effectiveAELock
+        if effectiveAELock != meteringState.aeLocked {
+            meteringState.aeLocked = effectiveAELock
             DispatchQueue.main.async {
                 self.isAELocked = effectiveAELock
             }
@@ -2014,7 +2307,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             device.exposurePointOfInterest = point
         }
 
-        if !sessionAELocked {
+        if !meteringState.aeLocked {
             if device.isExposureModeSupported(.continuousAutoExposure) {
                 device.exposureMode = .continuousAutoExposure
             } else if device.isExposureModeSupported(.autoExpose) {
@@ -2022,78 +2315,507 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
             }
         }
 
-        if mode == .centerWeighted {
-            applyExposureBiasLocked(0, to: device, force: true)
-        } else if mode == .highlight {
-            applyExposureBiasLocked(-0.25, to: device, force: true)
-        }
-
         RuntimeLog.info(
             "[Exposure]",
-            "meteringApplied mode=\(mode.logName) point=\(point.map { "\(Self.format($0.x)),\(Self.format($0.y))" } ?? "auto") aeLocked=\(sessionAELocked)"
+            "meteringApplied mode=\(mode.logName) point=\(point.map { "\(Self.format($0.x)),\(Self.format($0.y))" } ?? "auto") aeLocked=\(meteringState.aeLocked)"
         )
     }
 
     nonisolated private func updateAdaptiveMeteringBiasIfNeeded(
         buckets: [Int],
+        zones: MeteringZoneSummary,
         now: TimeInterval
     ) {
-        let mode = sessionMeteringMode
-        guard mode == .matrix || mode == .average || mode == .highlight else { return }
-        guard !sessionAELocked else { return }
-        guard now - lastMeteringBiasUpdateAt >= 0.45 else { return }
-        lastMeteringBiasUpdateAt = now
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            let mode = self.meteringState.mode
+            let profile = self.activeFilmProfile
+            guard !self.meteringState.aeLocked else { return }
+            guard now >= self.meteringState.adaptivePausedUntil else { return }
+            guard now - self.meteringState.lastUpdateTime >= self.meteringTuning.adaptiveInterval else { return }
+            guard self.pendingFocalTransition == nil,
+                  self.pendingOrientationTransition == nil else {
+                return
+            }
 
+            self.meteringState.lastUpdateTime = now
+            let decision = self.computeDesiredMeteringBias(
+                buckets: buckets,
+                zones: zones,
+                mode: mode,
+                profile: profile
+            )
+            let smoothedBias = self.smoothMeteringBiasLocked(
+                desired: decision.desiredBias,
+                now: now,
+                response: self.exposureResponse(
+                    profile: profile,
+                    environment: decision.environment
+                )
+            )
+            guard abs(smoothedBias - self.meteringState.bias) > self.meteringTuning.biasDeadband else {
+                return
+            }
+            guard let device = self.currentDevice else { return }
+
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                guard !self.meteringState.aeLocked,
+                      self.meteringState.mode == mode,
+                      self.activeFilmProfile == profile,
+                      self.pendingFocalTransition == nil,
+                      self.pendingOrientationTransition == nil else {
+                    return
+                }
+                self.applyExposureBiasLocked(smoothedBias, to: device, force: false)
+                RuntimeLog.info(
+                    "[Exposure]",
+                    "policy profile=\(profile.logName) env=\(decision.environment.kind.rawValue) desired=\(Self.format(CGFloat(decision.desiredBias))) applied=\(Self.format(CGFloat(smoothedBias)))"
+                )
+            } catch {
+                RuntimeLog.error("[Error]", "adaptiveMeteringBiasFailed error=\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func computeDesiredMeteringBias(
+        buckets: [Int],
+        zones: MeteringZoneSummary,
+        mode: MeteringMode,
+        profile: FilmProfile
+    ) -> MeteringBiasDecision {
+        let globalStats = globalMeteringStats(from: buckets)
+        let stats = weightedZoneStats(zones: zones, mode: mode)
+        let environment = exposureEnvironment(
+            globalStats: globalStats,
+            stats: stats,
+            zones: zones
+        )
+        let baseBias = baseMeteringBias(
+            globalStats: globalStats,
+            stats: stats,
+            zones: zones,
+            mode: mode
+        )
+        let profileBias = applyFilmProfileExposurePolicy(
+            baseBias: baseBias,
+            profile: profile,
+            environment: environment,
+            globalStats: globalStats,
+            stats: stats,
+            zones: zones,
+            mode: mode
+        )
+
+        return MeteringBiasDecision(
+            desiredBias: profileBias,
+            environment: environment
+        )
+    }
+
+    private func baseMeteringBias(
+        globalStats: MeteringWeightedStats,
+        stats: MeteringWeightedStats,
+        zones: MeteringZoneSummary,
+        mode: MeteringMode
+    ) -> Float {
+        switch mode {
+        case .average:
+            let base = (0.46 - zones.globalMean) * 1.05
+            let highlightProtection = max(0, zones.globalHighlightShare - 0.22) * 0.42
+            return Float(base - highlightProtection).clamped(to: -0.60...0.60)
+
+        case .matrix:
+            let base = (0.48 - stats.mean) * 0.92
+            let highlightProtection = max(0, stats.highlightShare - 0.13) * 0.82
+                + max(0, stats.hardHighlightShare - 0.035) * 1.15
+            let shadowRecovery = max(0, stats.shadowShare - 0.28) * 0.26
+            return Float(base - highlightProtection + shadowRecovery).clamped(to: -0.85...0.70)
+
+        case .centerWeighted:
+            let base = (0.50 - stats.mean) * 1.20
+            let highlightProtection = max(0, stats.highlightShare - 0.18) * 0.52
+                + max(0, stats.hardHighlightShare - 0.05) * 0.92
+            let shadowRecovery = max(0, stats.shadowShare - 0.30) * 0.22
+            return Float(base - highlightProtection + shadowRecovery).clamped(to: -0.85...0.80)
+
+        case .highlight:
+            let brightMeanControl = max(0, stats.mean - 0.45) * 0.72
+            let highlightProtection = max(0, stats.highlightShare - 0.04) * 1.55
+                + max(0, stats.hardHighlightShare - 0.01) * 2.25
+            let globalProtection = max(0, globalStats.hardHighlightShare - 0.015) * 0.85
+            let shadowRecovery = max(0, zones.globalShadowShare - 0.58) * 0.07
+            return Float(
+                -brightMeanControl
+                - highlightProtection
+                - globalProtection
+                + shadowRecovery
+            ).clamped(to: -1.35...0.05)
+        }
+    }
+
+    private func exposureEnvironment(
+        globalStats: MeteringWeightedStats,
+        stats: MeteringWeightedStats,
+        zones: MeteringZoneSummary
+    ) -> ExposureEnvironment {
+        let mean = stats.mean
+        let globalMean = zones.globalMean
+        let shadowShare = max(stats.shadowShare, globalStats.shadowShare)
+        let highlightShare = max(stats.highlightShare, globalStats.highlightShare)
+        let hardHighlightShare = max(stats.hardHighlightShare, globalStats.hardHighlightShare)
+
+        if hardHighlightShare > 0.035 || highlightShare > 0.34 {
+            return ExposureEnvironment(
+                kind: .hardHighlight,
+                intensity: max(
+                    ((hardHighlightShare - 0.018) / 0.10).clamped(to: 0...1),
+                    ((highlightShare - 0.24) / 0.36).clamped(to: 0...1)
+                )
+            )
+        }
+
+        if shadowShare > 0.40 && highlightShare > 0.14 {
+            return ExposureEnvironment(
+                kind: .highContrast,
+                intensity: min(1, shadowShare * 0.80 + highlightShare * 1.20)
+            )
+        }
+
+        if globalMean > mean + 0.10 && shadowShare > 0.28 {
+            return ExposureEnvironment(
+                kind: .backlit,
+                intensity: min(1, (globalMean - mean) * 4.0 + shadowShare * 0.42)
+            )
+        }
+
+        if globalMean < 0.30 || shadowShare > 0.56 {
+            return ExposureEnvironment(
+                kind: .lowLight,
+                intensity: max(
+                    ((0.34 - globalMean) / 0.22).clamped(to: 0...1),
+                    ((shadowShare - 0.42) / 0.38).clamped(to: 0...1)
+                )
+            )
+        }
+
+        if globalMean > 0.62 && shadowShare < 0.12 {
+            return ExposureEnvironment(
+                kind: .highKey,
+                intensity: ((globalMean - 0.58) / 0.24).clamped(to: 0...1)
+            )
+        }
+
+        if highlightShare < 0.09,
+           shadowShare < 0.22,
+           abs(globalMean - 0.50) < 0.18 {
+            return ExposureEnvironment(
+                kind: .overcast,
+                intensity: (1.0 - abs(globalMean - 0.50) / 0.18).clamped(to: 0...1)
+            )
+        }
+
+        return ExposureEnvironment(kind: .balanced, intensity: 0)
+    }
+
+    private func applyFilmProfileExposurePolicy(
+        baseBias: Float,
+        profile: FilmProfile,
+        environment: ExposureEnvironment,
+        globalStats: MeteringWeightedStats,
+        stats: MeteringWeightedStats,
+        zones: MeteringZoneSummary,
+        mode: MeteringMode
+    ) -> Float {
+        var bias = baseBias
+        let intensity = Float(environment.intensity)
+        let highlightExcess = Float(max(0, max(stats.highlightShare, globalStats.highlightShare) - 0.16))
+        let hardHighlightExcess = Float(max(0, max(stats.hardHighlightShare, globalStats.hardHighlightShare) - 0.018))
+        let shadowExcess = Float(max(0, max(stats.shadowShare, zones.globalShadowShare) - 0.42))
+
+        switch profile {
+        case .raw:
+            return Self.clamp(baseBias, to: -1.35...0.80)
+
+        case .vg:
+            bias -= highlightExcess * 0.18
+            bias -= hardHighlightExcess * 0.36
+            if environment.kind == .highContrast || environment.kind == .backlit {
+                bias -= 0.07 * intensity
+            } else if environment.kind == .lowLight {
+                bias += min(0.08, shadowExcess * 0.20)
+            } else if environment.kind == .overcast {
+                bias += 0.035 * intensity
+            }
+            return Self.clamp(bias, to: mode == .highlight ? -1.35...0.05 : -1.05...0.48)
+
+        case .ew:
+            if environment.kind == .overcast {
+                bias += 0.10 * intensity
+            } else if environment.kind == .highKey {
+                bias += 0.045 * intensity
+            } else if environment.kind == .lowLight {
+                bias += 0.06 * intensity
+            }
+            bias -= highlightExcess * 0.09
+            bias -= hardHighlightExcess * 0.32
+            return Self.clamp(bias, to: mode == .highlight ? -1.35...0.08 : -1.05...0.72)
+
+        case .lg:
+            bias -= highlightExcess * 0.16
+            bias -= hardHighlightExcess * 0.34
+            if environment.kind == .highContrast || environment.kind == .backlit {
+                bias -= 0.08 * intensity
+            } else if environment.kind == .lowLight {
+                bias += 0.035 * intensity
+            } else if environment.kind == .overcast {
+                bias += 0.04 * intensity
+            }
+            return Self.clamp(bias, to: mode == .highlight ? -1.35...0.05 : -1.05...0.38)
+        }
+    }
+
+    private func globalMeteringStats(from buckets: [Int]) -> MeteringWeightedStats {
         let total = max(1, buckets.reduce(0, +))
         let bucketCount = max(1, buckets.count)
         var weightedSum: CGFloat = 0
         var shadowCount = 0
         var highlightCount = 0
+        var hardHighlightCount = 0
 
         for (index, count) in buckets.enumerated() {
             let center = (CGFloat(index) + 0.5) / CGFloat(bucketCount)
             weightedSum += center * CGFloat(count)
-            if center < 0.18 { shadowCount += count }
-            if center > 0.82 { highlightCount += count }
+            if center < meteringTuning.shadowThreshold { shadowCount += count }
+            if center > meteringTuning.highlightThreshold { highlightCount += count }
+            if center > meteringTuning.hardHighlightThreshold { hardHighlightCount += count }
         }
 
-        let mean = weightedSum / CGFloat(total)
-        let shadowShare = CGFloat(shadowCount) / CGFloat(total)
-        let highlightShare = CGFloat(highlightCount) / CGFloat(total)
+        return MeteringWeightedStats(
+            mean: weightedSum / CGFloat(total),
+            shadowShare: CGFloat(shadowCount) / CGFloat(total),
+            highlightShare: CGFloat(highlightCount) / CGFloat(total),
+            hardHighlightShare: CGFloat(hardHighlightCount) / CGFloat(total)
+        )
+    }
 
-        let desiredBias: Float
-        switch mode {
-        case .average:
-            desiredBias = Float((0.46 - mean) * 1.15).clamped(to: -0.65...0.65)
-        case .matrix:
-            let base = (0.48 - mean) * 0.85
-            let highlightProtection = max(0, highlightShare - 0.12) * 0.95
-            let shadowRecovery = max(0, shadowShare - 0.24) * 0.32
-            desiredBias = Float(base - highlightProtection + shadowRecovery).clamped(to: -0.80...0.70)
-        case .highlight:
-            let highlightProtection = max(0, highlightShare - 0.05) * 1.65
-            let brightMeanControl = max(0, mean - 0.42) * 0.75
-            let shadowRecovery = max(0, shadowShare - 0.42) * 0.12
-            desiredBias = Float(-highlightProtection - brightMeanControl + shadowRecovery).clamped(to: -1.20...0.10)
-        case .centerWeighted:
-            desiredBias = 0
+    private func weightedZoneStats(
+        zones: MeteringZoneSummary,
+        mode: MeteringMode
+    ) -> MeteringWeightedStats {
+        guard !zones.means.isEmpty else {
+            return MeteringWeightedStats(
+                mean: zones.globalMean,
+                shadowShare: zones.globalShadowShare,
+                highlightShare: zones.globalHighlightShare,
+                hardHighlightShare: zones.globalHardHighlightShare
+            )
         }
 
-        guard abs(desiredBias - sessionMeteringBias) > 0.08 else { return }
+        let centerColumn = CGFloat(zones.columns - 1) / 2
+        let centerRow = CGFloat(zones.rows - 1) / 2
+        let maxDistance = max(0.001, sqrt(centerColumn * centerColumn + centerRow * centerRow))
+        var weightedMean: CGFloat = 0
+        var weightedShadowShare: CGFloat = 0
+        var weightedHighlightShare: CGFloat = 0
+        var weightedHardHighlightShare: CGFloat = 0
+        var totalWeight: CGFloat = 0
 
-        sessionQueue.async {
-            guard let device = self.currentDevice,
-                  !self.sessionAELocked,
-                  self.sessionMeteringMode == mode else {
-                return
+        for index in zones.means.indices {
+            let row = index / zones.columns
+            let column = index % zones.columns
+            let dx = CGFloat(column) - centerColumn
+            let dy = CGFloat(row) - centerRow
+            let normalizedDistance = min(1, sqrt(dx * dx + dy * dy) / maxDistance)
+            let countScale = CGFloat(max(1, zones.counts[index]))
+            let weight: CGFloat
+
+            switch mode {
+            case .average:
+                weight = 1
+            case .matrix:
+                let centerWeight = pow(1 - normalizedDistance, 1.35)
+                let highlightAttention = zones.highlightShares[index] * 0.35
+                    + zones.hardHighlightShares[index] * 0.75
+                weight = 0.26 + 0.74 * centerWeight + highlightAttention
+            case .centerWeighted:
+                let centerWeight = pow(1 - normalizedDistance, 2.6)
+                weight = 0.12 + 1.28 * centerWeight
+            case .highlight:
+                let brightLift = max(0, zones.means[index] - 0.68) * 1.20
+                weight = 0.10
+                    + brightLift
+                    + zones.highlightShares[index] * 2.10
+                    + zones.hardHighlightShares[index] * 3.20
             }
 
-            do {
-                try device.lockForConfiguration()
-                defer { device.unlockForConfiguration() }
-                self.applyExposureBiasLocked(desiredBias, to: device, force: false)
-            } catch {
-                RuntimeLog.error("[Error]", "adaptiveMeteringBiasFailed error=\(error.localizedDescription)")
+            let sampleWeight = weight * countScale
+            weightedMean += zones.means[index] * sampleWeight
+            weightedShadowShare += zones.shadowShares[index] * sampleWeight
+            weightedHighlightShare += zones.highlightShares[index] * sampleWeight
+            weightedHardHighlightShare += zones.hardHighlightShares[index] * sampleWeight
+            totalWeight += sampleWeight
+        }
+
+        let divisor = max(0.001, totalWeight)
+        return MeteringWeightedStats(
+            mean: weightedMean / divisor,
+            shadowShare: weightedShadowShare / divisor,
+            highlightShare: weightedHighlightShare / divisor,
+            hardHighlightShare: weightedHardHighlightShare / divisor
+        )
+    }
+
+    private func smoothMeteringBiasLocked(
+        desired: Float,
+        now: TimeInterval,
+        response: ExposureResponse
+    ) -> Float {
+        let previousTime = meteringState.lastSmoothingTime
+        let dt = previousTime > 0
+            ? max(0.001, now - previousTime)
+            : meteringTuning.adaptiveInterval
+        meteringState.lastSmoothingTime = now
+
+        let desiredDelta = abs(desired - meteringState.lastDesiredBias)
+        meteringState.lastDesiredBias = desired
+
+        var alpha = min(Float(dt) / response.smoothingTau, response.maxAlpha)
+        if desiredDelta > response.fastResponseThreshold {
+            alpha = response.fastAlpha
+        }
+
+        let previousBias = meteringState.smoothedBias
+        let candidate = alpha * desired + (1 - alpha) * previousBias
+        let delta = candidate - previousBias
+        let limitedDelta: Float
+        if delta >= 0 {
+            limitedDelta = min(delta, response.positiveStep)
+        } else {
+            limitedDelta = max(delta, -response.negativeStep)
+        }
+
+        meteringState.smoothedBias = previousBias + limitedDelta
+        return meteringState.smoothedBias
+    }
+
+    private func exposureResponse(
+        profile: FilmProfile,
+        environment: ExposureEnvironment
+    ) -> ExposureResponse {
+        var tau = meteringTuning.smoothingTau
+        var maxAlpha: Float = 0.30
+        var fastThreshold = meteringTuning.fastResponseThreshold
+        var fastAlpha: Float = 0.54
+        var positiveStep: Float = 0.16
+        var negativeStep: Float = 0.22
+
+        switch profile {
+        case .raw:
+            tau = 1.05
+            fastAlpha = 0.58
+            positiveStep = 0.18
+            negativeStep = 0.24
+        case .vg:
+            tau = 1.28
+            maxAlpha = 0.28
+            fastThreshold = 0.28
+            fastAlpha = 0.56
+            positiveStep = 0.13
+            negativeStep = 0.25
+        case .ew:
+            tau = 1.00
+            maxAlpha = 0.34
+            fastThreshold = 0.32
+            fastAlpha = 0.60
+            positiveStep = 0.18
+            negativeStep = 0.20
+        case .lg:
+            tau = 1.36
+            maxAlpha = 0.26
+            fastThreshold = 0.25
+            fastAlpha = 0.52
+            positiveStep = 0.11
+            negativeStep = 0.24
+        }
+
+        switch environment.kind {
+        case .hardHighlight:
+            negativeStep += 0.08
+            positiveStep *= 0.78
+            fastThreshold *= 0.82
+        case .highContrast, .backlit:
+            tau *= 1.10
+            positiveStep *= 0.82
+            negativeStep += 0.04
+        case .lowLight:
+            tau *= 1.16
+            positiveStep *= 0.72
+            negativeStep *= 0.82
+            maxAlpha = min(maxAlpha, 0.24)
+        case .overcast, .highKey:
+            tau *= 0.94
+        case .balanced:
+            break
+        }
+
+        return ExposureResponse(
+            smoothingTau: tau,
+            maxAlpha: maxAlpha,
+            fastResponseThreshold: fastThreshold,
+            fastAlpha: fastAlpha,
+            positiveStep: positiveStep,
+            negativeStep: negativeStep
+        )
+    }
+
+    private static func clamp(_ value: Float, to range: ClosedRange<Float>) -> Float {
+        min(max(value, range.lowerBound), range.upperBound)
+    }
+
+    private func resetMeteringBiasLocked(to device: AVCaptureDevice) {
+        meteringState.smoothedBias = 0
+        meteringState.lastDesiredBias = 0
+        meteringState.lastSmoothingTime = Self.now()
+        meteringState.adaptivePausedUntil = Self.now() + 0.20
+        applyExposureBiasLocked(0, to: device, force: true)
+    }
+
+    private func scheduleBiasRampToZero(duration: TimeInterval = 0.40) {
+        let now = Self.now()
+        let startBias = meteringState.bias
+        meteringState.adaptivePausedUntil = now + duration + 0.25
+        guard abs(startBias) > 0.03 else {
+            meteringState.smoothedBias = 0
+            meteringState.lastDesiredBias = 0
+            return
+        }
+
+        let steps = 5
+        for step in 1...steps {
+            let delay = duration * Double(step) / Double(steps)
+            sessionQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self,
+                      !self.meteringState.aeLocked,
+                      let device = self.currentDevice else {
+                    return
+                }
+
+                let progress = Float(step) / Float(steps)
+                let bias = startBias + (0 - startBias) * progress
+                do {
+                    try device.lockForConfiguration()
+                    defer { device.unlockForConfiguration() }
+                    self.applyExposureBiasLocked(bias, to: device, force: true)
+                    if step == steps {
+                        self.meteringState.smoothedBias = 0
+                        self.meteringState.lastDesiredBias = 0
+                        self.meteringState.lastSmoothingTime = Self.now()
+                    }
+                } catch {
+                    RuntimeLog.error("[Error]", "aeUnlockBiasRampFailed error=\(error.localizedDescription)")
+                }
             }
         }
     }
@@ -2106,9 +2828,13 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         let clampedBias = bias.clamped(
             to: device.minExposureTargetBias...device.maxExposureTargetBias
         )
-        guard force || abs(clampedBias - sessionMeteringBias) > 0.04 else { return }
+        guard force || abs(clampedBias - meteringState.bias) > meteringTuning.applyDeadband else { return }
         device.setExposureTargetBias(clampedBias)
-        sessionMeteringBias = clampedBias
+        meteringState.bias = clampedBias
+        if force {
+            meteringState.smoothedBias = clampedBias
+            meteringState.lastDesiredBias = clampedBias
+        }
         RuntimeLog.info("[Exposure]", "targetBias=\(Self.format(CGFloat(clampedBias)))")
     }
 
@@ -2118,7 +2844,10 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     ) -> ZoomCalibration {
         let baseEquivalent = max(nominalEquivalentFocalLength(for: device), 0.001)
         let requested = max(CGFloat(mm), 1.0)
-        let desiredZoom = requested / baseEquivalent
+        let desiredZoom = Self.zoomFactor(
+            targetFocalLength: requested,
+            baseEquivalentFocalLength: baseEquivalent
+        )
         let zoom = min(
             max(desiredZoom, device.minAvailableVideoZoomFactor),
             device.maxAvailableVideoZoomFactor
@@ -2138,14 +2867,14 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
     private func nominalEquivalentFocalLength(for device: AVCaptureDevice) -> CGFloat {
         switch device.deviceType {
         case .builtInUltraWideCamera:
-            return Self.nominalUltraWideEquivalent
+            return (cameraCapabilities.ultraWide35mmEquivalent ?? equivalentFocalLength(for: device))
+                .clamped(to: 10...22)
         case .builtInWideAngleCamera:
-            return Self.nominalWideEquivalent
+            return cameraCapabilities.wide35mmEquivalent
+                .clamped(to: 20...32)
         case .builtInTelephotoCamera:
             let measured = cameraCapabilities.telephoto35mmEquivalent ?? equivalentFocalLength(for: device)
-            return measured >= 100
-                ? Self.nominalTeleLongEquivalent
-                : Self.nominalTeleShortEquivalent
+            return measured.clamped(to: 60...135)
         default:
             return Self.nominalWideEquivalent
         }
@@ -2156,7 +2885,7 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         device: AVCaptureDevice,
         reason: String
     ) {
-        let message = "reason=\(reason) device=\(deviceLogName(for: device)) base=\(Self.format(calibration.baseEquivalentFocalLength)) actual=\(Self.format(calibration.actualEquivalentFocalLength)) zoom=\(Self.format(calibration.zoomFactor)) error=\(Self.format(calibration.errorRatio * 100))% clamped=\(calibration.wasClamped)"
+        let message = "reason=\(reason) device=\(deviceLogName(for: device)) fov=\(Self.format(CGFloat(device.activeFormat.videoFieldOfView))) base=\(Self.format(calibration.baseEquivalentFocalLength)) actual=\(Self.format(calibration.actualEquivalentFocalLength)) zoom=\(Self.format(calibration.zoomFactor)) error=\(Self.format(calibration.errorRatio * 100))% clamped=\(calibration.wasClamped)"
 
         if calibration.errorRatio > 0.05 {
             RuntimeLog.error("[FocalCalibration]", "targetMismatch \(message)")
@@ -2319,6 +3048,40 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         )
     }
 
+    nonisolated private static func highQualityResampledImage(
+        _ image: CIImage,
+        scale: CGFloat
+    ) -> CIImage {
+        guard abs(scale - 1.0) > 0.001 else { return image }
+
+        // Large upscales look cleaner when split into two Lanczos passes.
+        // 12MP -> 36MP stays one pass; narrow crops can benefit from two.
+        if scale > 2.05 {
+            let firstScale = sqrt(scale)
+            let firstPass = lanczosResampledImage(image, scale: firstScale)
+            return lanczosResampledImage(firstPass, scale: scale / firstScale)
+        }
+
+        return lanczosResampledImage(image, scale: scale)
+    }
+
+    nonisolated private static func lanczosResampledImage(
+        _ image: CIImage,
+        scale: CGFloat
+    ) -> CIImage {
+        guard let scaleFilter = CIFilter(name: "CILanczosScaleTransform") else {
+            return image
+        }
+
+        let normalized = normalizedImageExtent(image)
+        let outputExtent = scaledExtent(for: normalized.extent, scale: scale)
+        scaleFilter.setValue(normalized, forKey: kCIInputImageKey)
+        scaleFilter.setValue(scale, forKey: kCIInputScaleKey)
+        scaleFilter.setValue(1.0, forKey: "inputAspectRatio")
+        return (scaleFilter.outputImage ?? normalized)
+            .cropped(to: outputExtent)
+    }
+
     nonisolated private static func photoDimensionsLogName(_ dimensions: CMVideoDimensions) -> String {
         "\(dimensions.width)x\(dimensions.height)"
     }
@@ -2341,7 +3104,8 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         profile: FilmProfile,
         focalLength: Int,
         digitalZoomFactor: CGFloat,
-        iso: CGFloat
+        iso: CGFloat,
+        resampleScale: CGFloat
     ) -> DetailProcessingPlan {
         let focalBase: Float
         switch focalLength {
@@ -2367,6 +3131,9 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         case .ew:
             profileMultiplier = isLongFocal ? 0.30 : 0.30
             baseRadius = isLongFocal ? 0.48 : 0.52
+        case .lg:
+            profileMultiplier = isLongFocal ? 0.50 : 0.62
+            baseRadius = isLongFocal ? 0.54 : 0.82
         }
 
         let zoomDenoiseBoost: Float
@@ -2387,36 +3154,78 @@ final class CameraManager: NSObject, ObservableObject, @unchecked Sendable {
         }
 
         let isoAttenuation = Float(max(0.35, 1.0 - max(0.0, Double(iso) - 160.0) / 1000.0))
-        let sharpenIntensity = focalBase * profileMultiplier * isoAttenuation * sharpenScale
-        let radius = baseRadius * radiusScale
+        let upscaleSharpnessCompensation = Float(
+            min(1.16, 1.0 + max(0, resampleScale - 1.0) * 0.13)
+        )
+        let upscaleRadiusDamp = Float(
+            max(0.86, 1.0 - max(0, resampleScale - 1.0) * 0.06)
+        )
+        let sharpenIntensity = focalBase
+            * profileMultiplier
+            * isoAttenuation
+            * sharpenScale
+            * upscaleSharpnessCompensation
+        let radius = baseRadius * radiusScale * upscaleRadiusDamp
 
         let denoiseThreshold: CGFloat
         switch profile {
         case .raw: denoiseThreshold = 280
-        case .vg: denoiseThreshold = 180
-        case .ew: denoiseThreshold = 640
+        case .vg: denoiseThreshold = 320
+        case .ew: denoiseThreshold = 560
+        case .lg: denoiseThreshold = 320
         }
 
-        let shouldDenoise = iso > denoiseThreshold || zoomDenoiseBoost > 0
+        let upscaleDenoiseBoost: Float
+        if resampleScale > 1.75, iso > 160 {
+            upscaleDenoiseBoost = 0.003
+        } else if resampleScale > 1.45, iso > 240 {
+            upscaleDenoiseBoost = 0.002
+        } else {
+            upscaleDenoiseBoost = 0
+        }
+
+        let shouldDenoise = iso > denoiseThreshold
+            || zoomDenoiseBoost > 0
+            || upscaleDenoiseBoost > 0
         let noiseLevel: Float
         if shouldDenoise {
             let base: Float = {
                 switch profile {
                 case .ew: return 0.004
                 case .vg: return 0.006
+                case .lg: return 0.006
                 case .raw: return 0.008
                 }
             }()
-            let extraLimit: Float = profile == .ew ? 0.018 : (profile == .vg ? 0.024 : 0.030)
-            let extraDivisor: Float = profile == .ew ? 36_000.0 : (profile == .vg ? 34_000.0 : 28_000.0)
+            let extraLimit: Float
+            let extraDivisor: Float
+            switch profile {
+            case .ew:
+                extraLimit = 0.018
+                extraDivisor = 36_000.0
+            case .vg, .lg:
+                extraLimit = 0.024
+                extraDivisor = 34_000.0
+            case .raw:
+                extraLimit = 0.030
+                extraDivisor = 28_000.0
+            }
             let extra = min(extraLimit, max(0.0, Float(iso - denoiseThreshold) / extraDivisor))
-            noiseLevel = base + extra + zoomDenoiseBoost
+            noiseLevel = base + extra + zoomDenoiseBoost + upscaleDenoiseBoost
         } else {
             noiseLevel = 0
         }
 
         let reason: String
-        if iso > denoiseThreshold && zoomDenoiseBoost > 0 {
+        if iso > denoiseThreshold && zoomDenoiseBoost > 0 && upscaleDenoiseBoost > 0 {
+            reason = "isoZoomAndUpscaleAdaptive"
+        } else if iso > denoiseThreshold && upscaleDenoiseBoost > 0 {
+            reason = "isoAndUpscaleAdaptive"
+        } else if zoomDenoiseBoost > 0 && upscaleDenoiseBoost > 0 {
+            reason = "zoomAndUpscaleAdaptive"
+        } else if upscaleDenoiseBoost > 0 {
+            reason = "upscaleAdaptive"
+        } else if iso > denoiseThreshold && zoomDenoiseBoost > 0 {
             reason = "isoAndZoomAdaptive"
         } else if zoomDenoiseBoost > 0 {
             reason = "zoomAdaptive"

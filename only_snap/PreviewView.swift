@@ -389,11 +389,12 @@ extension FilmPreviewUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
 
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
             guard let metalLayer = inputs.metalLayer else { return }
-            renderCameraManager?.updatePreviewHistogram(from: pixelBuffer)
 
             if shouldDropStaleFrame(sampleBuffer: sampleBuffer, connection: connection, state: state) {
                 return
             }
+
+            renderCameraManager?.updatePreviewHistogram(from: pixelBuffer)
 
             guard let drawable = metalLayer.nextDrawable() else { return }
             let drawableWidth = drawable.texture.width
@@ -608,6 +609,8 @@ extension FilmPreviewUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
             return (image, "identity")
         case .landscapeLeft:
             return (image.oriented(.right), "rotate90CW")
+        case .landscapeRight:
+            return (image.oriented(.left), "rotate90CCW")
         }
     }
 

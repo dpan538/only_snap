@@ -25,7 +25,7 @@ enum Theme {
     enum Layout {
         // Portrait
         static let vfHPad: CGFloat            = 24
-        static let viewfinderTargetWidth: CGFloat = 342
+        static let viewfinderTargetWidth: CGFloat = 352
         static let topHUDTopLift: CGFloat     = 49
         static let topHUDToViewfinder: CGFloat = 19
         static let viewfinderToFocal: CGFloat = 10
@@ -37,7 +37,7 @@ enum Theme {
         static let proCapsuleCornerRadius: CGFloat = 12
         static let btnSize: CGFloat           = 70.3
         static let btnHitSize: CGFloat        = 84
-        static let sideButtonSpacing: CGFloat = 10
+        static let sideButtonSpacing: CGFloat = 5
         static let shutterOuter: CGFloat      = 100
         static let shutterInner: CGFloat      = 78
         static let shutterHitSize: CGFloat    = 112

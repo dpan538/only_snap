@@ -11,6 +11,8 @@ enum FilmProfileProcessor {
             VGProcessor.preheatResources()
         case .ew:
             EWProcessor.preheatResources()
+        case .lg:
+            LGProcessor.preheatResources()
         }
     }
 
@@ -27,6 +29,8 @@ enum FilmProfileProcessor {
             return VGProcessor.apply(to: image, focalLength: focalLength)
         case .ew:
             return EWProcessor.apply(to: image, focalLength: focalLength, useFastAnalysis: isPreview)
+        case .lg:
+            return LGProcessor.apply(to: image, focalLength: focalLength, isPreview: isPreview)
         }
     }
 }

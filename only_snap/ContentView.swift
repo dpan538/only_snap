@@ -19,13 +19,17 @@ private enum HistogramDisplayMode: Equatable {
 private enum GridGuideMode: Equatable {
     case off
     case thirds
-    case golden
+    case diagonal
+    case center
+    case frame
 
     var next: GridGuideMode {
         switch self {
         case .off: return .thirds
-        case .thirds: return .golden
-        case .golden: return .off
+        case .thirds: return .diagonal
+        case .diagonal: return .center
+        case .center: return .frame
+        case .frame: return .off
         }
     }
 
@@ -36,7 +40,17 @@ private enum GridGuideMode: Equatable {
     var label: String {
         switch self {
         case .off, .thirds: return "GRID"
-        case .golden: return "GOLD"
+        case .diagonal: return "DIAG"
+        case .center: return "CENTER"
+        case .frame: return "FRAME"
+        }
+    }
+
+    var capsuleWidth: CGFloat {
+        switch self {
+        case .center: return 84
+        case .frame: return 78
+        default: return 64
         }
     }
 }
@@ -68,7 +82,7 @@ struct ContentView: View {
     private let aspectAnimation = Animation.linear(duration: 0.16)
 
     private var iconRotation: Angle {
-        camera.cameraOrientation.isLandscape ? .degrees(90) : .degrees(0)
+        .degrees(camera.cameraOrientation.uiRotationAngle)
     }
 
     private var filmProfileButtonTitle: String {
@@ -102,7 +116,10 @@ struct ContentView: View {
 
                 focalRow
                     .frame(width: metrics.viewfinderWidth, height: L.focalRowHeight)
-                    .position(x: metrics.centerX, y: metrics.focalCenterY)
+                    .position(
+                        x: metrics.centerX + focalRowOffset.width,
+                        y: metrics.focalCenterY + focalRowOffset.height
+                    )
 
                 controlsBlock(width: metrics.viewfinderWidth)
                     .frame(width: metrics.viewfinderWidth, height: metrics.controlsHeight)
@@ -157,7 +174,8 @@ struct ContentView: View {
             safeBottom + L.focalReferenceControlsSafeBottomInset
         )
         let focalReferenceTop = focalReferenceBottom - focalReferenceHeight
-        let focalCenterY = focalReferenceTop - L.focalToButtons - L.focalRowHeight / 2
+        let focalCenterY = focalReferenceTop - L.focalToButtons - L.focalRowHeight / 2 + 12
+            + (camera.cameraOrientation.isLandscape ? 16 : 0)
         let focalTop = focalCenterY - L.focalRowHeight / 2
 
         let minTopHUDTop: CGFloat = 10
@@ -188,37 +206,67 @@ struct ContentView: View {
     }
 
     private func topHUD(width: CGFloat) -> some View {
-        let stripWidth = max(0, width - L.histogramWidth - L.topHUDSpacing)
+        let isLandscape = camera.cameraOrientation.isLandscape
+        let landscapeRailWidth = landscapeHUDRailWidth(for: width)
+        let histogramWidth = isLandscape ? landscapeRailWidth : L.histogramWidth
+        let histogramHeight = isLandscape ? landscapeRailWidth : L.topHUDHeight
 
-        return HStack(alignment: .top, spacing: L.topHUDSpacing) {
-            Button {
-                haptic.impactOccurred()
-                histogramMode = histogramMode.next
-            } label: {
-                MiniHistogramView(
-                    mode: histogramMode,
-                    samples: camera.histogramSamples
-                )
-                    .frame(width: L.histogramWidth, height: L.topHUDHeight)
+        return Group {
+            if isLandscape {
+                HStack(alignment: .top, spacing: 0) {
+                    Button {
+                        haptic.impactOccurred()
+                        histogramMode = histogramMode.next
+                    } label: {
+                        MiniHistogramView(
+                            mode: histogramMode,
+                            samples: camera.histogramSamples
+                        )
+                        .frame(width: histogramWidth, height: histogramHeight)
+                        .rotationEffect(iconRotation)
+                    }
+                    .buttonStyle(.plain)
+
+                    Color.clear
+                        .frame(width: landscapeHUDGroupGap)
+
+                    proControlStrip(isLandscape: true, railWidth: landscapeRailWidth)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .frame(width: width, height: max(L.topHUDHeight, histogramHeight), alignment: .leading)
+            } else {
+                let stripWidth = max(0, width - L.histogramWidth - L.topHUDSpacing)
+                HStack(alignment: .top, spacing: L.topHUDSpacing) {
+                    Button {
+                        haptic.impactOccurred()
+                        histogramMode = histogramMode.next
+                    } label: {
+                        MiniHistogramView(
+                            mode: histogramMode,
+                            samples: camera.histogramSamples
+                        )
+                        .frame(width: L.histogramWidth, height: L.topHUDHeight)
+                    }
+                    .buttonStyle(.plain)
+
+                    proControlStrip(isLandscape: false, railWidth: L.proCapsuleHitHeight)
+                        .frame(width: stripWidth, alignment: .leading)
+                }
+                .frame(width: width, height: L.topHUDHeight, alignment: .leading)
+                    .clipped()
             }
-            .buttonStyle(.plain)
-
-            proControlStrip
-                .frame(width: stripWidth, alignment: .leading)
         }
-        .frame(width: width, height: L.topHUDHeight, alignment: .leading)
-        .clipped()
-        .animation(selectionAnimation, value: histogramMode)
-        .animation(selectionAnimation, value: camera.captureOutputKind)
-        .animation(selectionAnimation, value: camera.isAELocked)
-        .animation(selectionAnimation, value: camera.meteringMode)
-        .animation(selectionAnimation, value: gridMode)
+            .animation(selectionAnimation, value: histogramMode)
+            .animation(selectionAnimation, value: camera.captureOutputKind)
+            .animation(selectionAnimation, value: camera.isAELocked)
+            .animation(selectionAnimation, value: camera.meteringMode)
+            .animation(selectionAnimation, value: gridMode)
     }
 
-    private var proControlStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                proCapsule(title: camera.captureOutputKind.rawValue, width: 58) {
+    @ViewBuilder
+    private func proControlStrip(isLandscape: Bool, railWidth: CGFloat) -> some View {
+        let controls = HStack(spacing: isLandscape ? landscapeCapsuleSpacing : 6) {
+                proCapsule(title: camera.captureOutputKind.rawValue, width: isLandscape ? railWidth : 58, railWidth: railWidth) {
                     haptic.impactOccurred()
                     camera.cycleCaptureOutputKind()
                 }
@@ -227,34 +275,45 @@ struct ContentView: View {
                     title: "AE",
                     systemName: camera.isAELocked ? "lock.fill" : "lock.open",
                     isActive: camera.isAELocked,
-                    width: 60
+                    width: isLandscape ? railWidth : 60,
+                    railWidth: railWidth
                 ) {
                     haptic.impactOccurred()
                     camera.toggleAELock()
                 }
 
-                proCapsule(title: "LEVEL", isActive: levelEnabled, width: 74) {
+                proCapsule(title: "LEVEL", isActive: levelEnabled, width: isLandscape ? railWidth : 74, railWidth: railWidth) {
                     haptic.impactOccurred()
                     levelEnabled.toggle()
                 }
 
-                proCapsule(title: gridMode.label, isActive: gridMode.isActive, width: 64) {
+                proCapsule(title: gridMode.label, isActive: gridMode.isActive, width: isLandscape ? railWidth : gridCapsuleWidth, railWidth: railWidth) {
                     haptic.impactOccurred()
                     gridMode = gridMode.next
                 }
 
                 proCapsule(
-                    title: camera.meteringMode.shortLabel,
+                    title: isLandscape ? "" : camera.meteringMode.shortLabel,
                     systemName: camera.meteringMode.systemImageName,
                     isActive: camera.meteringMode != .matrix,
-                    width: camera.meteringMode == .matrix ? 88 : 92
+                    width: isLandscape
+                        ? railWidth
+                        : (camera.meteringMode == .matrix ? 88 : 92),
+                    railWidth: railWidth
                 ) {
                     haptic.impactOccurred()
                     camera.cycleMeteringMode()
                 }
-            }
         }
-        .frame(height: L.proCapsuleHitHeight)
+
+        if isLandscape {
+            controls.frame(height: railWidth, alignment: .leading)
+        } else {
+            ScrollView(.horizontal, showsIndicators: false) {
+                controls
+            }
+            .frame(height: L.proCapsuleHitHeight)
+        }
     }
 
     private func proCapsule(
@@ -262,33 +321,59 @@ struct ContentView: View {
         systemName: String? = nil,
         isActive: Bool = false,
         width: CGFloat,
+        railWidth: CGFloat,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
+            let isLandscape = camera.cameraOrientation.isLandscape
+            let capsuleHeight = L.proCapsuleHeight
+            let hitHeight = isLandscape ? landscapeProCapsuleHitHeight : L.proCapsuleHitHeight
+            let visualWidth = isLandscape ? min(width, railWidth) : width
             ZStack {
                 HStack(spacing: 5) {
                     if !title.isEmpty {
                         Text(title)
-                            .font(.system(size: 12, weight: .semibold))
+                            .font(.system(size: isLandscape ? 11 : 12, weight: .semibold))
                             .kerning(0.6)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.72)
                     }
 
                     if let systemName {
                         Image(systemName: systemName)
-                            .font(.system(size: title.isEmpty ? 15 : 11, weight: .semibold))
+                            .font(.system(size: title.isEmpty ? (isLandscape ? 16 : 15) : (isLandscape ? 10.5 : 11), weight: .semibold))
                     }
                 }
-                .rotationEffect(iconRotation)
             }
             .foregroundColor(isActive ? Theme.Colors.cream : Theme.Colors.bodyDark)
-            .frame(width: width, height: L.proCapsuleHeight)
+            .frame(width: visualWidth, height: capsuleHeight)
             .background(proCapsuleShape.fill(isActive ? Theme.Colors.bodyDark : Theme.Colors.buttonFill.opacity(0.92)))
             .overlay(proCapsuleShape.strokeBorder(Theme.Colors.bodyDark.opacity(isActive ? 1.0 : 0.58), lineWidth: 1.2))
-            .frame(width: width, height: L.proCapsuleHitHeight)
+            .frame(
+                width: isLandscape ? railWidth : width,
+                height: isLandscape ? railWidth : hitHeight
+            )
             .contentShape(proCapsuleShape)
+            .rotationEffect(iconRotation)
         }
         .buttonStyle(.plain)
     }
+
+    private func landscapeHUDRailWidth(for hudWidth: CGFloat) -> CGFloat {
+        let capsuleCount: CGFloat = 5
+        let histogramCount: CGFloat = 1
+        let capsuleSpacing = landscapeCapsuleSpacing
+        let requiredSpacing = capsuleSpacing * (capsuleCount - 1)
+        let available = hudWidth - landscapeHUDGroupGap - requiredSpacing
+        let fitted = available / (capsuleCount + histogramCount)
+        return min(54, max(44, fitted))
+    }
+
+    private var landscapeHUDGroupGap: CGFloat { 50 }
+
+    private var landscapeCapsuleSpacing: CGFloat { 4 }
+
+    private var landscapeProCapsuleHitHeight: CGFloat { 54 }
 
     private var proCapsuleShape: RoundedRectangle {
         RoundedRectangle(cornerRadius: L.proCapsuleCornerRadius, style: .continuous)
@@ -330,7 +415,10 @@ struct ContentView: View {
                         }
 
                         if levelEnabled {
-                            LevelGuideView(rollDegrees: levelMotion.rollDegrees)
+                            LevelGuideView(
+                                rollDegrees: levelMotion.rollDegrees,
+                                orientation: camera.cameraOrientation
+                            )
                         }
 
                         ViewfinderCorners()
@@ -364,6 +452,7 @@ struct ContentView: View {
             leftButtons
                 .frame(width: width, alignment: .leading)
                 .offset(x: -(L.btnHitSize - L.btnSize) / 2)
+                .offset(y: 0)
             rightButtons
                 .frame(width: width, alignment: .trailing)
                 .offset(x: (L.btnHitSize - L.aspectButtonWidth) / 2)
@@ -374,21 +463,26 @@ struct ContentView: View {
 
     private var focalRow: some View {
         let focals = camera.availableFocalLengths.isEmpty ? [15, 28, 43, 85] : camera.availableFocalLengths
+        let isLandscape = camera.cameraOrientation.isLandscape
 
-        return HStack(alignment: .lastTextBaseline, spacing: 12) {
+        return HStack(alignment: .lastTextBaseline, spacing: isLandscape ? 8 : 12) {
             ForEach(focals, id: \.self) { mm in
                 Button { switchFocal(to: mm) } label: {
                     let isSelected = mm == camera.selectedFocalLength
+                    let selectedSize: CGFloat = isLandscape ? 25.2 : 33.3
+                    let inactiveSize: CGFloat = isLandscape ? 17.8 : 21
+                    let unitSize: CGFloat = isLandscape ? 10.8 : 13.5
+                    let unitWidth: CGFloat = isLandscape ? 18 : 29
                     HStack(alignment: .lastTextBaseline, spacing: 2) {
                         Text("\(mm)")
-                            .font(.system(size: isSelected ? 33.3 : 21, weight: isSelected ? .medium : .regular))
+                            .font(.system(size: isSelected ? selectedSize : inactiveSize, weight: isSelected ? .medium : .regular))
                             .foregroundColor(isSelected ? Theme.Colors.bodyDark : Theme.Colors.textMuted)
                         Text("mm")
-                            .font(.system(size: 13.5, weight: .regular))
+                            .font(.system(size: unitSize, weight: .regular))
                             .foregroundColor(Theme.Colors.textSubtle)
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
-                            .frame(width: isSelected ? 29 : 0, alignment: .leading)
+                            .frame(width: isSelected ? unitWidth : 0, alignment: .leading)
                             .clipped()
                             .opacity(isSelected ? 1 : 0)
                     }
@@ -401,6 +495,23 @@ struct ContentView: View {
         }
         .animation(selectionAnimation, value: camera.selectedFocalLength)
         .gesture(focalSwipeGesture)
+    }
+
+    private var focalRowOffset: CGSize {
+        switch camera.cameraOrientation {
+        case .portrait:
+            return .zero
+        case .landscapeLeft, .landscapeRight:
+            return CGSize(width: 25, height: 0)
+        }
+    }
+
+    private var gridCapsuleWidth: CGFloat {
+        guard camera.cameraOrientation.isLandscape else { return gridMode.capsuleWidth }
+        switch gridMode {
+        case .center: return 50
+        default: return 48
+        }
     }
 
     private var leftButtons: some View {
@@ -428,6 +539,7 @@ struct ContentView: View {
                 toggleFilmProfile()
             } label: {
                 filmProfileButton
+                    .offset(y: -4)
             }
             .buttonStyle(.plain)
         }
@@ -474,7 +586,11 @@ struct ContentView: View {
     }
 
     private var shutterButton: some View {
-        Button {
+        let isLandscape = camera.cameraOrientation.isLandscape
+        let shutterOuter = isLandscape ? L.shutterOuter * 0.90 : L.shutterOuter
+        let shutterInner = isLandscape ? L.shutterInner * 0.90 : L.shutterInner
+
+        return Button {
             guard camera.isSessionRunning else { return }
             shutterProgress = 0
             withAnimation(.linear(duration: 0.6)) {
@@ -491,7 +607,7 @@ struct ContentView: View {
 
                 Circle()
                     .strokeBorder(Theme.Colors.bodyDark.opacity(0.25), lineWidth: 2.5)
-                    .frame(width: L.shutterOuter, height: L.shutterOuter)
+                    .frame(width: shutterOuter, height: shutterOuter)
 
                 Circle()
                     .trim(from: 0, to: shutterProgress)
@@ -499,12 +615,12 @@ struct ContentView: View {
                         Theme.Colors.bodyDark,
                         style: StrokeStyle(lineWidth: 2.5, lineCap: .round)
                     )
-                    .frame(width: L.shutterOuter, height: L.shutterOuter)
+                    .frame(width: shutterOuter, height: shutterOuter)
                     .rotationEffect(.degrees(-90))
 
                 Circle()
                     .fill(Theme.Colors.bodyDark)
-                    .frame(width: L.shutterInner, height: L.shutterInner)
+                    .frame(width: shutterInner, height: shutterInner)
             }
             .contentShape(Circle())
         }
@@ -583,6 +699,8 @@ struct ContentView: View {
         case .vg:
             camera.requestFilmProfile(.ew)
         case .ew:
+            camera.requestFilmProfile(.lg)
+        case .lg:
             camera.requestFilmProfile(.raw)
         }
     }
@@ -754,16 +872,23 @@ private struct GridGuideView: View {
                             Color.white.opacity(0.52),
                             style: StrokeStyle(lineWidth: 1.9, lineCap: .round)
                         )
-                } else if mode == .golden {
-                    guidePath(width: width, height: height, ratios: [0.382, 0.618])
+                } else if mode == .diagonal {
+                    diagonalGuidePath(width: width, height: height)
                         .stroke(
-                            Color.white.opacity(0.22),
-                            style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
+                            Color.white.opacity(0.50),
+                            style: StrokeStyle(lineWidth: 1.8, lineCap: .round)
                         )
-                    goldenSpiralPath(width: width, height: height)
+                } else if mode == .center {
+                    centerGuidePath(width: width, height: height)
                         .stroke(
-                            Color.white.opacity(0.58),
-                            style: StrokeStyle(lineWidth: 2.1, lineCap: .round, lineJoin: .round)
+                            Color.white.opacity(0.56),
+                            style: StrokeStyle(lineWidth: 1.9, lineCap: .round)
+                        )
+                } else if mode == .frame {
+                    frameGuidePath(width: width, height: height)
+                        .stroke(
+                            Color.white.opacity(0.54),
+                            style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round)
                         )
                 }
             }
@@ -786,33 +911,67 @@ private struct GridGuideView: View {
         }
     }
 
-    private func goldenSpiralPath(width: CGFloat, height: CGFloat) -> Path {
+    private func diagonalGuidePath(width: CGFloat, height: CGFloat) -> Path {
         Path { path in
-            let center = CGPoint(x: width * 0.62, y: height * 0.42)
-            let maxRadius = min(width, height) * 0.70
-            let pointCount = 160
+            path.move(to: CGPoint(x: 0, y: 0))
+            path.addLine(to: CGPoint(x: width, y: height))
+            path.move(to: CGPoint(x: width, y: 0))
+            path.addLine(to: CGPoint(x: 0, y: height))
 
-            for index in 0...pointCount {
-                let progress = CGFloat(index) / CGFloat(pointCount)
-                let angle = -CGFloat.pi * 0.15 + progress * CGFloat.pi * 4.25
-                let radius = maxRadius * CGFloat(pow(Double(progress), 1.55))
-                let point = CGPoint(
-                    x: center.x + CGFloat(cos(Double(angle))) * radius,
-                    y: center.y + CGFloat(sin(Double(angle))) * radius
-                )
+            path.move(to: CGPoint(x: width * 0.5, y: 0))
+            path.addLine(to: CGPoint(x: width, y: height * 0.5))
+            path.move(to: CGPoint(x: width * 0.5, y: height))
+            path.addLine(to: CGPoint(x: 0, y: height * 0.5))
+        }
+    }
 
-                if index == 0 {
-                    path.move(to: point)
-                } else {
-                    path.addLine(to: point)
-                }
-            }
+    private func centerGuidePath(width: CGFloat, height: CGFloat) -> Path {
+        Path { path in
+            let center = CGPoint(x: width / 2, y: height / 2)
+            let longTick = min(width, height) * 0.16
+            let shortTick = min(width, height) * 0.045
+            path.move(to: CGPoint(x: center.x - longTick, y: center.y))
+            path.addLine(to: CGPoint(x: center.x - shortTick, y: center.y))
+            path.move(to: CGPoint(x: center.x + shortTick, y: center.y))
+            path.addLine(to: CGPoint(x: center.x + longTick, y: center.y))
+            path.move(to: CGPoint(x: center.x, y: center.y - longTick))
+            path.addLine(to: CGPoint(x: center.x, y: center.y - shortTick))
+            path.move(to: CGPoint(x: center.x, y: center.y + shortTick))
+            path.addLine(to: CGPoint(x: center.x, y: center.y + longTick))
+
+            let inner = CGRect(
+                x: width * 0.22,
+                y: height * 0.22,
+                width: width * 0.56,
+                height: height * 0.56
+            )
+            path.addRoundedRect(in: inner, cornerSize: CGSize(width: 10, height: 10))
+        }
+    }
+
+    private func frameGuidePath(width: CGFloat, height: CGFloat) -> Path {
+        Path { path in
+            let safe = CGRect(
+                x: width * 0.08,
+                y: height * 0.08,
+                width: width * 0.84,
+                height: height * 0.84
+            )
+            let inner = CGRect(
+                x: width * 0.16,
+                y: height * 0.16,
+                width: width * 0.68,
+                height: height * 0.68
+            )
+            path.addRoundedRect(in: safe, cornerSize: CGSize(width: 12, height: 12))
+            path.addRoundedRect(in: inner, cornerSize: CGSize(width: 9, height: 9))
         }
     }
 }
 
 private struct LevelGuideView: View {
     let rollDegrees: Double
+    let orientation: CameraOrientationState
 
     var body: some View {
         GeometryReader { geo in
@@ -822,6 +981,7 @@ private struct LevelGuideView: View {
             let isLevel = abs(rollDegrees) < 1.0
             let guideColor = isLevel ? Color.green.opacity(0.92) : Color.white.opacity(0.72)
             let referenceColor = Color.white.opacity(0.22)
+            let baseRotation = Double(orientation.uiRotationAngle)
 
             ZStack {
                 Path { path in
@@ -829,6 +989,7 @@ private struct LevelGuideView: View {
                     path.addLine(to: CGPoint(x: width * 0.82, y: centerY))
                 }
                 .stroke(referenceColor, style: StrokeStyle(lineWidth: 1.4, lineCap: .round, dash: [6, 8]))
+                .rotationEffect(.degrees(baseRotation), anchor: .center)
 
                 Path { path in
                     path.move(to: CGPoint(x: width * 0.17, y: centerY))
@@ -840,13 +1001,14 @@ private struct LevelGuideView: View {
                     guideColor,
                     style: StrokeStyle(lineWidth: isLevel ? 4.2 : 3.2, lineCap: .round)
                 )
-                .rotationEffect(.degrees(rollDegrees), anchor: .center)
+                .rotationEffect(.degrees(baseRotation + rollDegrees), anchor: .center)
                 .shadow(color: .black.opacity(0.35), radius: 3, x: 0, y: 1)
 
                 RoundedRectangle(cornerRadius: 2.5)
                     .fill(guideColor)
                     .frame(width: isLevel ? 18 : 14, height: isLevel ? 5 : 4)
                     .position(x: width / 2.0, y: centerY)
+                    .rotationEffect(.degrees(baseRotation), anchor: .center)
                     .shadow(color: .black.opacity(0.30), radius: 2, x: 0, y: 1)
             }
         }
